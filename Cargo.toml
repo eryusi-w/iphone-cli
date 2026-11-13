@@ -30,6 +30,8 @@ idevice = { version = "=0.1.68", features = [
   "cryptexd",
   "tss",
   "heartbeat",
+  "installation_proxy",
+  "screenshotr",
 ] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
@@ -37,6 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 plist = "1.8"
 regex = "1"
+quick-xml = "0.42"
 unicode-normalization = "0.1"
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }

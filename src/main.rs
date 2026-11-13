@@ -397,6 +397,19 @@ async fn run(cli: Cli) -> i32 {
         Cmd::Scripts | Cmd::Devices => unreachable!(),
     };
 
+    // iOS 17 미만은 CoreDevice/RSD가 없어 이 경로로는 닿지 않는다.
+    // legacy 모듈이 lockdown+DDI+DVT로 처리하고, 아니면 None을 준다.
+    if cmd == "doctor"
+        && let Some(value) = iphone_cli::device::legacy::doctor(&udid, started).await
+    {
+        print(&value, human_out, cmd);
+        return exit_code(&value);
+    }
+    if let Some(value) = iphone_cli::device::legacy::handle(&udid, cmd, &args, started).await {
+        print(&value, human_out, cmd);
+        return exit_code(&value);
+    }
+
     let value = client::request(&udid, cmd, args).await;
     print(&value, human_out, cmd);
     exit_code(&value)
