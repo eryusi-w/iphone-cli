@@ -405,6 +405,11 @@ async fn run(cli: Cli) -> i32 {
         print(&value, human_out, cmd);
         return exit_code(&value);
     }
+    // iOS 17~26은 입력 서비스가 없어 WDA로만 터치가 된다.
+    if let Some(value) = iphone_cli::device::legacy::touch_fallback(&udid, cmd, &args, started).await {
+        print(&value, human_out, cmd);
+        return exit_code(&value);
+    }
     if let Some(value) = iphone_cli::device::legacy::handle(&udid, cmd, &args, started).await {
         print(&value, human_out, cmd);
         return exit_code(&value);

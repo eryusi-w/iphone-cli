@@ -362,9 +362,39 @@ async fn via_wda(provider: &dyn IdeviceProvider, cmd: &str, args: &Value) -> Opt
 
 async fn wda_tap(args: &Value, client: &mut wda::Wda<'_>) -> Res {
     let target = args["target"].as_str().unwrap_or_default();
-    if args["long_ms"].as_u64().is_some() {
-        return Err(err("wda_unsupported", "--long is not supported over WebDriverAgent yet")
-            .hint(t("좌표 탭(x,y)으로 대신해 보세요.", "Use a coordinate tap (x,y) instead.")));
+    let long_ms = args["long_ms"].as_u64();
+    let double = args["double"].as_bool().unwrap_or(false);
+    if (long_ms.is_some() || double) && parse_point(target).is_none() {
+        // 요소를 찾아 그 중앙에서 제스처를 한다.
+        let screen = client.screen().await.map_err(wda_fail)?;
+        let element = match screen.elements.iter().find(|e| e.label.as_deref().is_some_and(|l| l == target || l.contains(target))) {
+            Some(e) => e,
+            None => {
+                return Err(err("element_not_found", format!("no element matched \"{target}\""))
+                    .hint(t("`iph read`로 라벨을 확인하세요.", "Check the label with `iph read`.")));
+            }
+        };
+        let f = element.frame.ok_or_else(|| err("element_not_found", "element has no frame"))?;
+        let (cx, cy) = (f.x + f.w / 2.0, f.y + f.h / 2.0);
+        if double {
+            client.double_tap(cx, cy).await.map_err(wda_fail)?;
+        } else if let Some(ms) = long_ms {
+            client.long_press(cx, cy, ms).await.map_err(wda_fail)?;
+        }
+        return Ok(fields! {
+            "sent": true, "verified": false, "via": "wda", "target": target,
+            "gesture": if double { "double_tap" } else { "long_press" },
+        });
+    }
+    if let Some((x, y)) = parse_point(target) {
+        if double {
+            client.double_tap(x, y).await.map_err(wda_fail)?;
+            return Ok(fields! { "sent": true, "verified": false, "via": "wda", "target": target, "gesture": "double_tap" });
+        }
+        if let Some(ms) = long_ms {
+            client.long_press(x, y, ms).await.map_err(wda_fail)?;
+            return Ok(fields! { "sent": true, "verified": false, "via": "wda", "target": target, "gesture": "long_press" });
+        }
     }
     if let Some((x, y)) = parse_point(target) {
         client.tap_point(x, y).await.map_err(wda_fail)?;
@@ -515,6 +545,12 @@ fn unsupported(cmd: &str, version: &str) -> Fail {
     .with("supported", json!(SUPPORTED))
 }
 
+/// iOS 17~26에는 입력 서비스(displayservice, iOS 27)가 없어서 터치가 안 된다.
+/// 이 구간은 WebDriverAgent 러너로만 손을 움직일 수 있다.
+fn touch_needs_wda(major: u64) -> bool {
+    (17..27).contains(&major)
+}
+
 /// iOS 17 미만 폰이면 이 명령을 여기서 처리하고 결과를 돌려준다.
 /// iOS 17+ 이거나 이 모듈이 다루지 않는 명령이면 `None`.
 pub async fn handle(udid: &str, cmd: &str, args: &Value, started: Instant) -> Option<Value> {
@@ -537,6 +573,42 @@ pub async fn handle(udid: &str, cmd: &str, args: &Value, started: Instant) -> Op
         },
     };
     Some(envelope(result, started))
+}
+
+/// iOS 17~26의 입력 명령을 WDA로 보낸다. 그 밖의 버전은 `None`.
+///
+/// iOS 27+는 displayservice가 있어 원래 경로로 충분하고, iOS <17은
+/// `handle`이 이미 처리한다. 여기서는 그 사이(iOS 18 등)만 맡는다.
+pub async fn touch_fallback(
+    udid: &str,
+    cmd: &str,
+    args: &Value,
+    started: Instant,
+) -> Option<Value> {
+    if !matches!(cmd, "tap" | "type" | "swipe" | "button") {
+        return None;
+    }
+    let route = conn::route(udid).await.ok()?;
+    let version = version_of(&*route.provider).await?;
+    let major = major_of(&version)?;
+    if !touch_needs_wda(major) {
+        return None;
+    }
+    match via_wda(&*route.provider, cmd, args).await {
+        Some(res) => Some(envelope(res, started)),
+        None => {
+            let fail = err(
+                "touch_needs_wda",
+                format!("iOS {version} has no input service (iOS 27+); touch needs a WebDriverAgent runner"),
+            )
+            .hint(t(
+                "이 iOS 버전에서는 WebDriverAgent 러너를 설치·기동해야 `tap`·`type`·`swipe`·`button`이 동작합니다(wda-build/README.md).",
+                "On this iOS version, install and start a WebDriverAgent runner to use tap/type/swipe/button (see wda-build/README.md).",
+            ))
+            .with("ios_version", json!(version));
+            Some(envelope(Err(fail), started))
+        }
+    }
 }
 
 /// iOS 17 미만 폰이면 `iph doctor` 결과를 여기서 만든다.
@@ -651,6 +723,15 @@ mod tests {
         assert_eq!(major_of("27.0.1"), Some(27));
         assert_eq!(major_of(""), None);
         assert_eq!(major_of("beta"), None);
+    }
+
+    #[test]
+    fn touch_gate_covers_17_to_26_only() {
+        assert!(!touch_needs_wda(16));
+        assert!(touch_needs_wda(17));
+        assert!(touch_needs_wda(18));
+        assert!(touch_needs_wda(26));
+        assert!(!touch_needs_wda(27));
     }
 
     #[test]

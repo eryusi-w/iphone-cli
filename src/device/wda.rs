@@ -349,6 +349,24 @@ impl<'a> Wda<'a> {
             .await
     }
 
+    /// 두 번 탭. 웹뷰 안의 링크가 한 번 탭에 반응하지 않을 때 쓴다.
+    pub async fn double_tap(&mut self, x: f64, y: f64) -> Result<()> {
+        let id = self.session().await?;
+        let body = json!({ "x": x, "y": y });
+        self.json_request("POST", &format!("/session/{id}/wda/doubleTap"), Some(&body))
+            .await?;
+        Ok(())
+    }
+
+    /// 길게 누르기.
+    pub async fn long_press(&mut self, x: f64, y: f64, duration_ms: u64) -> Result<()> {
+        let id = self.session().await?;
+        let body = json!({ "x": x, "y": y, "duration": (duration_ms.max(500)) as f64 / 1000.0 });
+        self.json_request("POST", &format!("/session/{id}/wda/touchAndHold"), Some(&body))
+            .await?;
+        Ok(())
+    }
+
     pub async fn type_text(&mut self, text: &str) -> Result<()> {
         let id = self.session().await?;
         let body = json!({ "value": [text] });
