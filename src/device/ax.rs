@@ -35,6 +35,11 @@ use crate::ax::{
 use crate::tcp::handle::AdapterHandle;
 
 pub const SERVICE: &str = "com.apple.accessibility.axAuditDaemon.remoteAXService";
+/// 같은 감사 데몬을 iOS 17~26은 shim/legacy 이름으로 광고한다.
+pub const ALTERNATE_SERVICES: &[&str] = &[
+    "com.apple.accessibility.axAuditDaemon.remoteserver.shim.remote",
+    "com.apple.accessibility.axAuditDaemon.remoteserver",
+];
 /// The phone never answers a request sooner than this (about 1.1 s typical).
 pub const ANSWER_AT_LEAST: Duration = Duration::from_millis(700);
 const SUBSCRIBE: &str = "clientNeedsAccessibility:";
@@ -102,11 +107,10 @@ impl Drop for AxSub {
 
 impl AxSub {
     pub async fn open(adapter: &mut AdapterHandle, rsd: &RsdHandshake) -> Result<Self> {
-        let port = rsd
-            .services
-            .get(SERVICE)
-            .ok_or_else(|| anyhow!("the phone does not offer {SERVICE}"))?
-            .port;
+        let port = std::iter::once(SERVICE)
+            .chain(ALTERNATE_SERVICES.iter().copied())
+            .find_map(|name| rsd.services.get(name).map(|svc| svc.port))
+            .ok_or_else(|| anyhow!("the phone does not offer {SERVICE}"))?;
         let stream = adapter.connect(port).await?;
         let mut dtx = RemoteServerClient::new(stream);
         subscribe(&mut dtx).await?;

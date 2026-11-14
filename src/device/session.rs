@@ -288,14 +288,34 @@ impl Session {
         if self.tunnel.is_none() {
             // One tunnel at a time: let go of an abandoned one first.
             self.sweep().await;
-            let tunnel = conn::open_tunnel(&self.udid).await.map_err(|e| {
-                Fail::not_sent("tunnel_failed", format!("{e:#}")).hint(t(
+            // The tunnel setup drops transiently (lock, cable renegotiation);
+            // a short retry rides over most of those without user action.
+            let mut last = None;
+            for attempt in 0..3 {
+                match conn::open_tunnel(&self.udid).await {
+                    Ok(tunnel) => {
+                        self.connects += 1;
+                        self.tunnel = Some(tunnel);
+                        break;
+                    }
+                    Err(e) => {
+                        last = Some(e);
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(700 * (attempt as u64 + 1))).await;
+                        }
+                    }
+                }
+            }
+            if self.tunnel.is_none() {
+                return Err(Fail::not_sent(
+                    "tunnel_failed",
+                    format!("{:#}", last.unwrap_or_else(|| anyhow::anyhow!("tunnel failed"))),
+                )
+                .hint(t(
                     "폰이 같은 Wi-Fi에 있거나 USB로 연결되어 있고 잠금이 풀려 있는지 확인하세요. `iph doctor`로 점검할 수 있습니다.",
                     "Check that the phone is on the same Wi-Fi or plugged in, and unlocked. Run `iph doctor`.",
-                ))
-            })?;
-            self.connects += 1;
-            self.tunnel = Some(tunnel);
+                )));
+            }
         }
         Ok(self.tunnel.as_mut().unwrap())
     }

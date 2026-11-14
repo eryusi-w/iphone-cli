@@ -585,7 +585,11 @@ pub async fn touch_fallback(
     args: &Value,
     started: Instant,
 ) -> Option<Value> {
-    if !matches!(cmd, "tap" | "type" | "swipe" | "button") {
+    let is_input = matches!(cmd, "tap" | "type" | "swipe" | "button");
+    // iOS 17~26은 접근성 서비스 이름도 달라서(axAuditDaemon.remoteserver.shim.remote)
+    // 원래 경로로는 읽기가 안 된다. WDA가 있으면 그쪽이 유일한 읽기 경로다.
+    let is_read = matches!(cmd, "read" | "find");
+    if !(is_input || is_read) {
         return None;
     }
     let route = conn::route(udid).await.ok()?;
@@ -596,19 +600,11 @@ pub async fn touch_fallback(
     }
     match via_wda(&*route.provider, cmd, args).await {
         Some(res) => Some(envelope(res, started)),
-        None => {
-            let fail = err(
-                "touch_needs_wda",
-                format!("iOS {version} has no input service (iOS 27+); touch needs a WebDriverAgent runner"),
-            )
-            .hint(t(
-                "이 iOS 버전에서는 WebDriverAgent 러너를 설치·기동해야 `tap`·`type`·`swipe`·`button`이 동작합니다(wda-build/README.md).",
-                "On this iOS version, install and start a WebDriverAgent runner to use tap/type/swipe/button (see wda-build/README.md).",
-            ))
-            .with("ios_version", json!(version));
-            Some(envelope(Err(fail), started))
-        }
+        // WDA가 없으면 원래 경로를 그대로 시도한다. iOS 18처럼 입력 서비스가
+        // 실제로 있는 버전도 있어서 여기서 단정하지 않는다.
+        None => None,
     }
+
 }
 
 /// iOS 17 미만 폰이면 `iph doctor` 결과를 여기서 만든다.

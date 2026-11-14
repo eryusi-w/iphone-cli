@@ -75,8 +75,9 @@ impl Check {
 }
 
 const SETTINGS: &str = "com.apple.Preferences";
+// `ax::SERVICE` is checked separately: iOS 17~26 advertise the same audit
+// daemon under `ax::ALTERNATE_SERVICES` names instead.
 const NEEDED_SERVICES: &[&str] = &[
-    ax::SERVICE,
     "com.apple.coredevice.displayservice",
     "com.apple.coredevice.hid.universalhidservice",
     "com.apple.coredevice.appservice",
@@ -123,11 +124,20 @@ async fn lockdown_facts(provider: &dyn IdeviceProvider) -> LockdownFacts {
 /// cannot be opened.
 async fn missing_services(s: &mut Session) -> Result<Vec<&'static str>, String> {
     match s.ensure_tunnel().await {
-        Ok(tunnel) => Ok(NEEDED_SERVICES
-            .iter()
-            .filter(|name| !tunnel.rsd.services.contains_key(**name))
-            .copied()
-            .collect()),
+        Ok(tunnel) => {
+            let mut missing: Vec<&'static str> = NEEDED_SERVICES
+                .iter()
+                .filter(|name| !tunnel.rsd.services.contains_key(**name))
+                .copied()
+                .collect();
+            let ax_offered = std::iter::once(ax::SERVICE)
+                .chain(ax::ALTERNATE_SERVICES.iter().copied())
+                .any(|name| tunnel.rsd.services.contains_key(name));
+            if !ax_offered {
+                missing.insert(0, ax::SERVICE);
+            }
+            Ok(missing)
+        }
         Err(f) => Err(f.message),
     }
 }
