@@ -927,6 +927,43 @@ mod tests {
     }
 
     #[test]
+    fn type_observations_reach_scripts_and_a_withheld_submit_stops_them() {
+        let mut fake = Fake::default();
+        let observation = json!({
+            "ok": true, "outcome": "done", "sent": true, "verified": true,
+            "value_before": "", "value": "", "value_changed": false,
+            "screen_changed": false, "submit_sent": false,
+            "warning": {"code": "value_unchanged", "message": "unchanged"},
+        });
+        fake.answers.insert("type".into(), observation.clone());
+        let (res, _) = go(&mut fake, "return type('hello')", json!({}), limits());
+        assert_eq!(res.unwrap()["outputs"], observation);
+
+        let mut fake = Fake::default();
+        let mut blocked = observation;
+        blocked["ok"] = json!(false);
+        blocked["outcome"] = json!("unknown");
+        blocked["error"] = json!({"code": "type_not_verified", "message": "Return was not sent"});
+        fake.answers.insert("type".into(), blocked);
+        let (res, kept) = go(
+            &mut fake,
+            "try { type('hello', {submit: true}) } catch (e) {}\nkey('return'); type('hello');",
+            json!({}),
+            limits(),
+        );
+        let fail = res.unwrap_err();
+        assert_eq!(fail.outcome, Outcome::Unknown);
+        assert_eq!(fail.extra["reason"]["code"], "type_not_verified");
+        assert_eq!(fail.extra["warning"]["code"], "value_unchanged");
+        assert_eq!(
+            fake.asked.len(),
+            1,
+            "neither Return nor a duplicate paste reaches the phone"
+        );
+        assert_eq!(kept.end, End::Stopped("unknown_outcome"));
+    }
+
+    #[test]
     fn a_script_that_never_ends_is_stopped() {
         let short = || Limits { timeout: Duration::from_millis(300), memory: 32 << 20 };
         let began = Instant::now();

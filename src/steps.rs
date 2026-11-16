@@ -1156,10 +1156,7 @@ impl Session {
                     other => actions::parse_args(other)?,
                 };
                 let r = Box::pin(self.cmd_type(args)).await?;
-                no_value(fields! {
-                    "value": r.get("value").cloned().unwrap_or(Value::Null),
-                    "clipboard_restored": r.get("clipboard_restored").cloned().unwrap_or(Value::Null),
-                })
+                no_value(r)
             }
             "swipe" => {
                 let args: SwipeArgs = match body {
@@ -1228,7 +1225,7 @@ impl Session {
         // The app the last `launch` step brought to the front. Every later
         // step must still find it there.
         let mut expected_pid: Option<i64> = None;
-        // Steps that sent something to the phone and completed.
+        // Steps that sent input, or may have, including the failing step.
         let mut inputs_sent = 0u32;
         let today = today_days();
         for (i, raw) in steps.iter().enumerate() {
@@ -1275,7 +1272,7 @@ impl Session {
                     }
                     let mut rec = fields! { "index": index, "kind": kind, "ok": true, "elapsed_ms": ms };
                     for (k, v) in extra {
-                        if !v.is_null() {
+                        if !v.is_null() || kind == "type" {
                             rec.insert(k, v);
                         }
                     }
@@ -1285,6 +1282,9 @@ impl Session {
                     }
                 }
                 Err(mut f) => {
+                    if f.outcome != crate::reply::Outcome::NotSent {
+                        inputs_sent += 1;
+                    }
                     // Whoever wrote the steps knows what this one usually waits on.
                     if let Some(hint) = hint {
                         f.hint = Some(hint);

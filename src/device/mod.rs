@@ -5,3 +5,4 @@ pub mod legacy;
 pub mod session;
 pub mod wda;
 pub mod wda_source;
+pub mod wifi;

@@ -115,6 +115,120 @@ pub struct TypeArgs {
     pub submit: bool,
 }
 
+/// Observations before Return. Reading a value is distinct from seeing it
+/// change, and neither proves that it equals the caller's intended text.
+struct TypeObservation {
+    before: Option<String>,
+    value: Option<String>,
+    changed: Option<bool>,
+    warning: Option<Value>,
+}
+
+impl TypeObservation {
+    fn new(args: &TypeArgs, before: Option<String>, value: Option<String>) -> Self {
+        let changed = before.as_ref().zip(value.as_ref()).map(|(a, b)| a != b);
+        let retry_hint = t(
+            "입력이 반영되었을 수 있습니다. 자동으로 재입력하지 말고 `iph read`나 스크린샷으로 확인하세요.",
+            "Input may have taken effect. Do not automatically retype; check with `iph read` or a screenshot.",
+        );
+        let warning = if value.is_none() {
+            Some(json!({
+                "code": "value_unreadable",
+                "message": "the input was sent but the field's value could not be read afterwards",
+                "hint": retry_hint,
+            }))
+        } else if args.text.is_empty() && value.as_deref() == Some("") {
+            // Clearing an already empty field is an observable no-op.
+            None
+        } else if args.text.is_empty() {
+            Some(json!({
+                "code": "clear_not_observed",
+                "message": "the clear input was sent but the field still shows a nonempty value",
+                "hint": retry_hint,
+            }))
+        } else if changed == Some(false) {
+            Some(json!({
+                "code": "value_unchanged",
+                "message": "the field's value is unchanged; the paste may not have taken effect (identical replacement, masking or app behavior can also cause this)",
+                "hint": t(
+                    "자동으로 재입력하지 말고 `iph read`나 스크린샷으로 확인하세요. 붙여넣기가 막혔을 수도 있습니다: 설정 → 앱 → 해당 앱 → 다른 앱에서 붙여넣기 → 허용. 값이 같다는 사실만으로 권한 거부를 확정할 수는 없습니다.",
+                    "Do not automatically retype; check with `iph read` or a screenshot. Pasting may be blocked: Settings → Apps → this app → Paste from Other Apps → Allow. An unchanged value alone does not prove permission was denied.",
+                ),
+            }))
+        } else if value.as_deref() == Some("") {
+            Some(json!({
+                "code": "value_empty",
+                "message": "the input was sent but the field shows an empty value; the app may have cleared it",
+                "hint": retry_hint,
+            }))
+        } else if changed.is_none() {
+            Some(json!({
+                "code": "value_change_unknown",
+                "message": "the field's value was read afterwards, but its previous value was unavailable for comparison",
+                "hint": retry_hint,
+            }))
+        } else {
+            None
+        };
+        Self {
+            before,
+            value,
+            changed,
+            warning,
+        }
+    }
+
+    fn can_submit(&self) -> bool {
+        self.warning.is_none()
+    }
+
+    fn result(
+        self,
+        args: &TypeArgs,
+        field: &Element,
+        restored: bool,
+        submitted: Option<bool>,
+        screen_changed: Option<bool>,
+        submit_error: Option<String>,
+    ) -> Res {
+        let blocked_submit = args.submit && !self.can_submit();
+        let mut out = fields! {
+            "sent": true,
+            "verified": self.value.is_some(),
+            "value_before": self.before,
+            "value": self.value,
+            "value_changed": self.changed,
+            "field": brief(field),
+            "submit_sent": submitted,
+            "clipboard_restored": restored,
+            "screen_changed": screen_changed,
+        };
+        if let Some(warning) = self.warning {
+            out.insert("warning".into(), warning);
+        }
+        let fail = if let Some(e) = submit_error {
+            Some(Fail::unknown("input_failed", e))
+        } else if blocked_submit {
+            Some(Fail::unknown(
+                "type_not_verified",
+                "the input was sent, but its effect is uncertain; Return was not sent",
+            ))
+        } else {
+            None
+        };
+        if let Some(mut fail) = fail {
+            fail.hint = Some(t(
+                "입력은 이미 나갔습니다. 자동으로 재입력하거나 제출하지 말고 `iph read`나 스크린샷으로 먼저 확인하세요.",
+                "Input has already been sent. Do not automatically retype or submit; check with `iph read` or a screenshot first.",
+            ).into());
+            fail.extra = out;
+            Err(fail)
+        } else {
+            Ok(out)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyArgs {
@@ -1050,17 +1164,17 @@ impl Session {
     }
 
     /// What a field shows after a paste, asked of the phone directly: again
-    /// every 0.1 s until it differs from before (the paste has landed) or
+    /// every 0.1 s until it differs from before or
     /// `PASTE_SHOWS` has passed. `None` when the phone does not answer, and
     /// the caller reads the whole screen instead.
     async fn field_value(&mut self, field: &Element) -> Option<String> {
         let key = field.key?;
-        let before = field.value.clone().unwrap_or_default();
+        let before = field.value.as_deref();
         let began = Instant::now();
         loop {
             let value = self.ax.as_mut()?.ask(key, attrs::VALUE, ASK_WAIT).await?;
-            let now = crate::ax::tree::text(Some(&value)).unwrap_or_default();
-            if now != before || began.elapsed() >= PASTE_SHOWS {
+            let now = crate::ax::tree::value_text(Some(&value))?;
+            if Some(now.as_str()) != before || began.elapsed() >= PASTE_SHOWS {
                 return Some(now);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1074,7 +1188,9 @@ impl Session {
         if args.text.len() > 1024 * 1024 {
             return Err(Fail::invalid("text is larger than 1 MiB"));
         }
-        let (_, screen) = self.screen(Fresh::MaxAge(reuse()), false, BuildOptions::default()).await?;
+        let (_, screen) = self
+            .screen(Fresh::Force, false, BuildOptions::default())
+            .await?;
         let Some(field) = Self::focused_field(&screen).cloned() else {
             return Err(Fail::not_sent(
                 "no_focused_field",
@@ -1135,7 +1251,7 @@ impl Session {
                 .with("clipboard_restored", restored));
         }
 
-        // The paste has happened by now, so the clipboard can go back while
+        // The paste keys have gone out, so the clipboard can go back while
         // the field is read. The temporary keyboard stays attached meanwhile:
         // the screen holds still and Return can follow at once. What the field
         // shows is reported, not judged: apps format, mask, correct and clear
@@ -1148,22 +1264,29 @@ impl Session {
                 return Some(value);
             }
             let (_, screen) = self.observe(keys_began, Duration::ZERO).await?;
-            Self::focused_field(&screen)
-                .or_else(|| screen.by_id(&field.id))
-                .map(|e| e.value.clone().unwrap_or_default())
+            // Focus may have moved to a permission dialog or another field.
+            // Only the original field can tell us what this paste changed.
+            screen.by_id(&field.id).and_then(|e| e.value.clone())
         };
         let (restored, value) = tokio::join!(restoring, reading);
         trace(|| format!("type: read back={} clipboard_restored={restored}", value.is_some()));
+        let observation = TypeObservation::new(&args, field.value.clone(), value);
 
-        let mut submitted = false;
+        let mut submitted = Some(false);
         let mut submit_error = None;
-        if args.submit
-            && let Some(input) = self.input.as_mut() {
+        if args.submit && observation.can_submit() {
+            if let Some(input) = self.input.as_mut() {
                 match input.keyboard_press(&[(crate::keys::KEY_RETURN, vec![])]).await {
-                    Ok(()) => submitted = true,
-                    Err(e) => submit_error = Some(format!("{e:#}")),
+                    Ok(()) => submitted = Some(true),
+                    Err(e) => {
+                        submitted = None;
+                        submit_error = Some(format!("{e:#}"));
+                    }
                 }
+            } else {
+                submit_error = Some("the input session closed before Return could be sent".into());
             }
+        }
         if let Some(input) = self.input.as_mut()
             && input.keyboard_detach().await.is_err() {
                 self.drop_input();
@@ -1172,22 +1295,28 @@ impl Session {
         // the screen without it.
         self.invalidate_readings();
 
-        if let Some(e) = submit_error {
+        if submit_error.is_some() {
             self.drop_input();
-            return Err(Fail::unknown("input_failed", e)
-                .with("value", value.clone().map(Value::String).unwrap_or(Value::Null))
-                .with("clipboard_restored", restored));
         }
-        let mut out = fields! {
-            "sent": true,
-            "verified": value.is_some(),
-            "value": value,
-            "field": brief(&field),
-            "submit_sent": submitted,
-            "clipboard_restored": restored,
-            "screen_changed": true,
-        };
+        // Compare complete readings after the temporary keyboard is gone.
+        // A field read alone cannot tell whether the rest of the screen moved.
+        let screen_changed = self
+            .observe(keys_began, AFTER_PASTE)
+            .await
+            .map(|(_, after)| after.signature() != screen.signature());
+        let mut result = observation.result(
+            &args,
+            &field,
+            restored,
+            submitted,
+            screen_changed,
+            submit_error,
+        );
         if !restored && saved.unreadable() {
+            let out = match &mut result {
+                Ok(out) => out,
+                Err(fail) => &mut fail.extra,
+            };
             out.insert(
                 "clipboard_note".into(),
                 json!(t(
@@ -1196,7 +1325,7 @@ impl Session {
                 )),
             );
         }
-        Ok(out)
+        result
     }
 }
 
@@ -1380,6 +1509,186 @@ impl Clipboard {
             (Peek::Image(..), Peek::Image(..)) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod type_tests {
+    use super::*;
+    use crate::reply::envelope;
+
+    fn field(before: Option<&str>) -> Element {
+        serde_json::from_value(json!({
+            "id": "original", "role": "text_field", "value": before, "focused": true,
+        }))
+        .unwrap()
+    }
+
+    fn result(
+        args: &TypeArgs,
+        before: Option<&str>,
+        after: Option<&str>,
+        screen: Option<bool>,
+    ) -> Value {
+        let field = field(before);
+        let observed = TypeObservation::new(args, field.value.clone(), after.map(String::from));
+        let submit = args.submit && observed.can_submit();
+        envelope(
+            observed.result(args, &field, true, Some(submit), screen, None),
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn changed_values_are_observations_not_exact_text_matches() {
+        for value in ["30000", "₩ 30,000", "•••••", "corrected text", " \n "] {
+            let args = TypeArgs {
+                text: "30000".into(),
+                submit: true,
+                ..Default::default()
+            };
+            let out = result(&args, Some(""), Some(value), Some(true));
+            assert_eq!(out["ok"], true, "{out}");
+            assert_eq!(out["outcome"], "done");
+            assert_eq!(out["verified"], true);
+            assert_eq!(out["value_before"], "");
+            assert_eq!(out["value"], value);
+            assert_eq!(out["value_changed"], true);
+            assert_eq!(out["screen_changed"], true);
+            assert_eq!(out["submit_sent"], true);
+            assert!(out.get("warning").is_none());
+        }
+    }
+
+    #[test]
+    fn unchanged_paste_warns_without_claiming_permission_was_denied() {
+        let args = TypeArgs {
+            text: "테스트 문장".into(),
+            ..Default::default()
+        };
+        for value in ["", "old text", "•••••"] {
+            let out = result(&args, Some(value), Some(value), Some(false));
+            assert_eq!(out["ok"], true);
+            assert_eq!(out["outcome"], "done");
+            assert_eq!(out["sent"], true);
+            assert_eq!(out["verified"], true, "verified still means read back");
+            assert_eq!(out["value_changed"], false);
+            assert_eq!(out["screen_changed"], false);
+            assert_eq!(out["warning"]["code"], "value_unchanged");
+            assert!(
+                out["warning"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("may not")
+            );
+            assert!(out["warning"]["hint"].as_str().is_some());
+        }
+        // A dialog or another part of the screen may change while the field does not.
+        let out = result(&args, Some(""), Some(""), Some(true));
+        assert_eq!(out["value_changed"], false);
+        assert_eq!(out["screen_changed"], true);
+        assert!(out.get("warning").is_some());
+    }
+
+    #[test]
+    fn unreadable_and_uncomparable_values_do_not_become_empty_strings() {
+        let args = TypeArgs {
+            text: "hello".into(),
+            ..Default::default()
+        };
+        let out = result(&args, Some("old"), None, None);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["verified"], false);
+        assert!(out["value"].is_null());
+        assert!(out["value_changed"].is_null());
+        assert!(out["screen_changed"].is_null());
+        assert_eq!(out["warning"]["code"], "value_unreadable");
+        let out = result(&args, None, Some("hello"), Some(true));
+        assert_eq!(out["verified"], true);
+        assert!(out["value_before"].is_null());
+        assert!(out["value_changed"].is_null());
+        assert_eq!(out["warning"]["code"], "value_change_unknown");
+        // A readable field does not imply a complete screen comparison succeeded.
+        let out = result(&args, Some(""), Some("hello"), None);
+        assert_eq!(out["verified"], true);
+        assert!(out["screen_changed"].is_null());
+    }
+
+    #[test]
+    fn submit_is_withheld_when_the_input_effect_needs_review() {
+        let args = TypeArgs {
+            text: "hello".into(),
+            submit: true,
+            ..Default::default()
+        };
+        for (before, after, code) in [
+            (Some(""), Some(""), "value_unchanged"),
+            (Some("old"), Some("old"), "value_unchanged"),
+            (Some("old"), None, "value_unreadable"),
+            (None, Some("hello"), "value_change_unknown"),
+            (Some("old"), Some(""), "value_empty"),
+        ] {
+            let out = result(&args, before, after, Some(false));
+            assert_eq!(out["ok"], false, "{out}");
+            assert_eq!(out["outcome"], "unknown");
+            assert_eq!(out["sent"], true);
+            assert_eq!(out["submit_sent"], false);
+            assert_eq!(out["error"]["code"], "type_not_verified");
+            assert_eq!(out["warning"]["code"], code);
+            assert_eq!(out["value"], json!(after));
+            assert_eq!(out["clipboard_restored"], true);
+        }
+    }
+
+    #[test]
+    fn clear_and_identical_replacement_are_reported_separately() {
+        let mut args = TypeArgs {
+            clear: true,
+            submit: true,
+            ..Default::default()
+        };
+        for before in [Some(""), Some("old"), None] {
+            let out = result(&args, before, Some(""), Some(false));
+            assert_eq!(out["ok"], true);
+            assert_eq!(out["submit_sent"], true);
+            assert!(out.get("warning").is_none());
+        }
+        let out = result(&args, Some("old"), Some("old"), Some(false));
+        assert_eq!(out["warning"]["code"], "clear_not_observed");
+        assert_eq!(out["submit_sent"], false);
+        // Replacing with identical text can be intentional, but it does not
+        // establish whether paste worked. The caller must inspect before Return.
+        args.text = "same".into();
+        let out = result(&args, Some("same"), Some("same"), Some(false));
+        assert_eq!(out["outcome"], "unknown");
+        assert_eq!(out["warning"]["code"], "value_unchanged");
+    }
+
+    #[test]
+    fn failed_return_keeps_observations_and_does_not_claim_it_was_unsent() {
+        let args = TypeArgs {
+            text: "hello".into(),
+            submit: true,
+            ..Default::default()
+        };
+        let field = field(Some(""));
+        let observed = TypeObservation::new(&args, field.value.clone(), Some("hello".into()));
+        let out = envelope(
+            observed.result(
+                &args,
+                &field,
+                false,
+                None,
+                None,
+                Some("write failed".into()),
+            ),
+            Instant::now(),
+        );
+        assert_eq!(out["outcome"], "unknown");
+        assert_eq!(out["error"]["code"], "input_failed");
+        assert!(out["submit_sent"].is_null());
+        assert_eq!(out["value_changed"], true);
+        assert_eq!(out["clipboard_restored"], false);
     }
 }
 

@@ -46,6 +46,29 @@ fn element_line(e: &Value) -> String {
     line
 }
 
+fn type_observation(v: &Value, out: &mut Vec<String>) {
+    if v.get("value_changed").is_some() {
+        let parts: Vec<String> = [
+            "verified",
+            "value_before",
+            "value",
+            "value_changed",
+            "screen_changed",
+            "submit_sent",
+        ]
+        .iter()
+        .map(|key| format!("{key}={}", v[*key]))
+        .collect();
+        out.push(format!("  {}", parts.join("  ")));
+    }
+    if let Some(message) = v["warning"]["message"].as_str() {
+        out.push(format!("  ⚠ {}: {message}", s(&v["warning"]["code"])));
+        if let Some(hint) = v["warning"]["hint"].as_str() {
+            out.push(format!("  → {hint}"));
+        }
+    }
+}
+
 pub fn render(cmd: &str, v: &Value) -> String {
     let mut out = Vec::new();
     if v["ok"] != true {
@@ -82,6 +105,7 @@ pub fn render(cmd: &str, v: &Value) -> String {
             let l: Vec<String> = labels.iter().map(s).collect();
             out.push(format!("  on screen: {}", l.join(" · ")));
         }
+        type_observation(v, &mut out);
         out.push(format!("  {} ms", s(&v["elapsed_ms"])));
         return out.join("\n");
     }
@@ -106,6 +130,13 @@ pub fn render(cmd: &str, v: &Value) -> String {
                 let indent = "  ".repeat(e["depth"].as_u64().unwrap_or(0) as usize);
                 out.push(format!("{indent}{}", element_line(e)));
             }
+        }
+        "diagnose" => {
+            out.push(s(&v["report"]));
+            for finding in v["findings"].as_array().into_iter().flatten() {
+                out.push(format!("  {}", s(finding)));
+            }
+            out.push(s(&v["hint"]));
         }
         "doctor" => {
             for c in v["checks"].as_array().into_iter().flatten() {
@@ -165,6 +196,9 @@ pub fn render(cmd: &str, v: &Value) -> String {
                     s(&st["kind"]),
                     s(&st["elapsed_ms"])
                 ));
+                if st["kind"] == "type" {
+                    type_observation(st, &mut out);
+                }
             }
             if let Some(o) = v["outputs"].as_object() {
                 for (k, val) in o {
@@ -179,6 +213,9 @@ pub fn render(cmd: &str, v: &Value) -> String {
         _ => {
             let mut parts = vec!["✓".to_string()];
             for key in ["screen_changed", "foreground", "found", "scrolls", "value", "clipboard_restored", "path", "state", "stopped", "on", "focus", "set_by_iph"] {
+                if v.get("value_changed").is_some() && matches!(key, "value" | "screen_changed") {
+                    continue;
+                }
                 if !v[key].is_null() {
                     parts.push(format!("{key}={}", s(&v[key])));
                 }
@@ -192,6 +229,7 @@ pub fn render(cmd: &str, v: &Value) -> String {
             out.push(parts.join("  "));
         }
     }
+    type_observation(v, &mut out);
     out.join("\n")
 }
 
@@ -199,6 +237,37 @@ pub fn render(cmd: &str, v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn type_warnings_and_unknown_observations_are_visible() {
+        let mut value = json!({
+            "ok": true, "value_before": "", "value": "", "verified": true,
+            "value_changed": false, "screen_changed": false, "submit_sent": false,
+            "warning": {"code": "value_unchanged", "message": "value is unchanged", "hint": "check paste permission"},
+        });
+        let text = render("type", &value);
+        assert!(text.contains("value_before=\"\""));
+        assert!(text.contains("value_changed=false"));
+        assert!(text.contains("value_unchanged: value is unchanged"));
+        assert!(text.contains("check paste permission"));
+        let mut step = value.clone();
+        step["kind"] = json!("type");
+        let batch = json!({"ok": true, "steps": [step]});
+        assert!(render("batch", &batch).contains("value_unchanged: value is unchanged"));
+        value["value"] = Value::Null;
+        value["value_changed"] = Value::Null;
+        value["screen_changed"] = Value::Null;
+        value["verified"] = json!(false);
+        let text = render("type", &value);
+        assert!(text.contains("value=null"));
+        assert!(text.contains("screen_changed=null"));
+        value["ok"] = json!(false);
+        value["error"] = json!({"code": "type_not_verified", "message": "Return withheld"});
+        let text = render("type", &value);
+        assert!(text.contains("Return withheld"));
+        assert!(text.contains("value_changed=null"));
+        assert!(text.contains("value_unchanged: value is unchanged"));
+    }
 
     #[test]
     fn element_without_label() {

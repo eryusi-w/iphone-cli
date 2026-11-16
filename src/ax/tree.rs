@@ -150,15 +150,21 @@ fn handle(key: &ObjKey) -> String {
     format!("{:08x}", (h >> 32) as u32)
 }
 
-pub(crate) fn text(v: Option<&Ka>) -> Option<String> {
-    let s = match v? {
+/// A readable value, including an empty or whitespace-only string. Missing
+/// attributes and unsupported values are not evidence of an empty field.
+pub(crate) fn value_text(v: Option<&Ka>) -> Option<String> {
+    Some(match v? {
         Ka::Str(s) => s.clone(),
         other @ Ka::Obj { .. } => other.text()?,
         Ka::Int(i) => i.to_string(),
         Ka::UInt(u) => u.to_string(),
         Ka::Real(r) => r.to_string(),
         _ => return None,
-    };
+    })
+}
+
+pub(crate) fn text(v: Option<&Ka>) -> Option<String> {
+    let s = value_text(v)?;
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
 }
@@ -280,8 +286,8 @@ impl Screen {
             }
             let label = text(raw.attrs.get(&attrs::LABEL))
                 .or_else(|| text(raw.attrs.get(&attrs::LABEL_PLAIN)));
-            let value = text(raw.attrs.get(&attrs::VALUE));
-            let has_text = label.is_some() || value.is_some();
+            let value = value_text(raw.attrs.get(&attrs::VALUE));
+            let has_text = label.is_some() || value.as_ref().is_some_and(|v| !v.trim().is_empty());
             screen.elements.push(Element {
                 id,
                 role: attrs::role_name(role_num, bits, raw.is_application, has_text).to_string(),
@@ -376,6 +382,65 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_values_keep_empty_and_whitespace_distinct_from_missing() {
+        for (raw, expected) in [
+            (Ka::Str(String::new()), Some("")),
+            (Ka::Str(" \n ".into()), Some(" \n ")),
+            (Ka::Str("  hello  ".into()), Some("  hello  ")),
+            (Ka::Int(0), Some("0")),
+            (Ka::Null, None),
+            (Ka::Bool(false), None),
+            (
+                Ka::Obj {
+                    class: "Unknown".into(),
+                    fields: vec![],
+                },
+                None,
+            ),
+        ] {
+            assert_eq!(value_text(Some(&raw)).as_deref(), expected);
+        }
+        assert_eq!(value_text(None), None);
+        // Labels keep their existing whitespace normalization.
+        assert_eq!(
+            text(Some(&Ka::Str("  hello  ".into()))).as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn screen_build_preserves_an_empty_field_value() {
+        use crate::ax::dump::DumpKind;
+        let key = ObjKey {
+            pid: 10,
+            object_id: 1,
+        };
+        let mut dump = Dump {
+            kind: DumpKind::Initial,
+            applications: vec![key],
+            elements: [(
+                key,
+                RawElement {
+                    is_application: true,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            order: vec![key],
+        };
+        let missing = Screen::build(&dump, BuildOptions::default());
+        dump.elements
+            .get_mut(&key)
+            .unwrap()
+            .attrs
+            .insert(attrs::VALUE, Ka::Str(String::new()));
+        let empty = Screen::build(&dump, BuildOptions::default());
+        assert_eq!(missing.elements[0].value, None);
+        assert_eq!(empty.elements[0].value.as_deref(), Some(""));
+        assert_ne!(missing.signature(), empty.signature());
+    }
 
     #[test]
     fn parses_rect_strings() {
