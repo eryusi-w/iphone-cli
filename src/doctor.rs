@@ -324,8 +324,12 @@ fn wifi_check(
             );
         }
     }
-    if network == Ok(true) || (network.is_ok() && state.is_none() && connection == Some("wifi")) {
+    if network == Ok(true) {
         return c.detail(detail.join("; "));
+    }
+    if connection == Some("wifi") && network == Ok(false) {
+        detail.push("direct IP route selected; reachability is checked by the required checks".into());
+        return c.status("info").detail(detail.join("; "));
     }
     c = c.status("warn").detail(detail.join("; "));
     if network.is_err() {
@@ -336,8 +340,8 @@ fn wifi_check(
     }
     match state {
         Some(state) if state.enabled() => c.action(
-            "EnableWifiConnections와 EnableWifiDebugging은 모두 켜져 있지만 usbmuxd에 Network 연결이 없습니다. 폰과 컴퓨터가 같은 Wi-Fi 대역에 있는지, 공유기의 AP/클라이언트 격리가 꺼져 있는지, mDNS/Bonjour(_apple-mobdev2._tcp.local.)가 차단되지 않는지 확인하세요. 설정 직후라면 잠시 뒤 `iph doctor`를 다시 실행하세요.",
-            "EnableWifiConnections and EnableWifiDebugging are both on, but usbmuxd has no Network connection. Check the same Wi-Fi subnet, AP/client isolation, and whether mDNS/Bonjour (_apple-mobdev2._tcp.local.) is blocked. If just enabled, run `iph doctor` again shortly.",
+            "EnableWifiConnections와 EnableWifiDebugging은 모두 켜져 있지만 usbmuxd에 Network 연결이 없습니다. 폰과 컴퓨터가 같은 LAN에 있는지, 공유기의 AP/클라이언트 격리가 꺼져 있는지, mDNS/Bonjour(_apple-mobdev2._tcp.local.)가 차단되지 않는지 확인하세요. 폰 IP를 알면 `iph --udid <UDID> connect --ip <폰 IP>`로 직접 등록할 수 있습니다. 설정 직후라면 잠시 뒤 `iph doctor`를 다시 실행하세요.",
+            "EnableWifiConnections and EnableWifiDebugging are both on, but usbmuxd has no Network connection. Check the same LAN, AP/client isolation, and whether mDNS/Bonjour (_apple-mobdev2._tcp.local.) is blocked. If the phone IP is known, register it with `iph --udid <UDID> connect --ip <phone IP>`. If just enabled, run `iph doctor` again shortly.",
         ),
         _ => c.action(
             "기기의 무선 플래그를 확인하지 못했습니다(원인은 detail 참고). USB로 연결하고 잠금을 풀어 '이 컴퓨터를 신뢰'를 확인한 뒤 `iph doctor`를 다시 실행하세요. 무선 설정은 Finder/Apple 기기 앱과 Xcode의 'Connect via network'에서도 확인할 수 있습니다.",
@@ -401,8 +405,8 @@ pub async fn run(s: &mut Session, args: DoctorArgs) -> Res {
             .status("fail")
             .detail(format!("{e:#}"))
             .action(
-                "폰을 USB로 연결하거나, 컴퓨터와 같은 Wi-Fi에 두고 화면을 켜 주세요.",
-                "Plug the phone in, or put it on the computer's Wi-Fi and wake its screen.",
+                "폰을 USB로 연결하거나 컴퓨터와 같은 LAN에 두고 화면을 켜 주세요. USB로 신뢰한 폰이 자동 검색되지 않으면 `iph --udid <UDID> connect --ip <폰 IP>`로 직접 주소를 등록할 수 있습니다.",
+                "Plug the phone in, or put it on the same LAN and wake its screen. If a USB-paired phone is not discovered, register its address with `iph --udid <UDID> connect --ip <phone IP>`.",
             ),
     });
 
@@ -476,7 +480,7 @@ pub async fn run(s: &mut Session, args: DoctorArgs) -> Res {
                 }
             }
             if mounted_from.is_some() {
-                s.reset();
+                s.reset("the developer disk image was mounted");
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 missing = missing_services(s).await;
             }
@@ -536,7 +540,7 @@ pub async fn run(s: &mut Session, args: DoctorArgs) -> Res {
         let launched = if locked == Some(true) {
             None
         } else {
-            Some(match s.cmd_launch(LaunchArgs { app: SETTINGS.into(), restart: false }).await {
+            Some(match s.cmd_launch(LaunchArgs { app: SETTINGS.into(), ..Default::default() }).await {
                 Ok(r) => Ok((
                     r.get("foreground").and_then(|v| v.as_bool()) == Some(true),
                     r.get("pid").and_then(|v| v.as_i64()),
@@ -675,6 +679,17 @@ mod tests {
 
     fn wireless(values: [Option<bool>; 4]) -> wifi::Wireless {
         wifi::Wireless { values, ..Default::default() }
+    }
+
+    #[test]
+    fn direct_wifi_route_does_not_claim_that_discovery_was_fixed() {
+        let c = wifi_check(Some("wifi"), None, Ok(false));
+        assert_eq!(c.status, "info");
+        assert!(!c.auto_fixed);
+        assert!(c.user_action.is_none());
+        let detail = c.detail.unwrap();
+        assert!(detail.contains("no usbmuxd Network entry"));
+        assert!(detail.contains("direct IP route selected"));
     }
 
     #[test]

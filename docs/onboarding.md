@@ -38,17 +38,39 @@ UI 자동화 활성화 스위치는 직접 읽지 않습니다. 터치가 실제
 
 같은 Wi-Fi에 있어도 무선 발견 설정이 꺼져 있으면 폰이 보이지 않을 수 있습니다. USB로 연결한 뒤 `iph doctor`를 실행하면 `com.apple.mobile.wireless_lockdown`의 `SupportsWifi`, `SupportsWifiSyncing`, `EnableWifiConnections`, `EnableWifiDebugging`을 읽습니다.
 
+지원되는 기기는 두 활성화 플래그가 모두 `true`여야 무선으로 발견될 수 있습니다. 하나라도 꺼져 있으면 Bonjour 광고가 나오지 않아 같은 대역에서도 usbmuxd에 `Network` 엔트리가 나타나지 않을 수 있습니다. 일반 `setup`·`doctor`는 이 설정을 바꾸지 않습니다.
+
 ```sh
 iph setup --fix-wifi
 iph doctor --fix-wifi
 ```
 
-두 명령은 `--fix-wifi`가 있을 때만 무선 플래그를 바꿉니다. USB로 지원 여부가 확인되면 명시적으로 `false`인 활성화 플래그만 켜고 다시 읽습니다. 알 수 없는 값은 바꾸지 않습니다. 변경 후 같은 UDID의 `Network` 엔트리를 최대 4초 기다립니다.
+두 명령은 `--fix-wifi`가 있을 때만 무선 플래그를 바꿉니다(MCP `iph_doctor`: `fix_wifi: true`). USB에서 지원 플래그 중 하나가 `true`로 확인되면 명시적으로 `false`인 활성화 플래그만 켜고 다시 읽습니다. 알 수 없는 값은 바꾸지 않습니다. 변경 후 같은 UDID의 `Network` 엔트리를 최대 4초 기다립니다. doctor는 사람이 볼 때 `--human`을 붙이고, setup은 대화형 안내를 따릅니다.
 
 - `auto_fixed: true`는 플래그가 바뀌었다는 뜻입니다. 무선 발견 성공은 `wifi.status: "ok"`로 확인합니다.
-- 읽기·쓰기·시간 초과 오류는 `checks[].detail`에 담깁니다.
+- 읽기·쓰기·발견 조회·시간 초과 오류는 `checks[].detail`에 담깁니다. 조회 실패를 꺼진 플래그나 네트워크 문제로 단정하지 않습니다.
 - 직접 설정하려면 Finder/Apple 기기 앱의 'Wi-Fi에 있을 때 이 iPhone 보기'와 Xcode의 'Connect via network'를 확인합니다.
 - 두 활성화 플래그가 모두 켜져 있는데도 발견되지 않으면 같은 Wi-Fi 대역, AP/클라이언트 격리, mDNS 차단을 확인합니다. Bonjour 서비스 이름은 `_apple-mobdev2._tcp.local.`입니다.
+
+### IP 직접 연결
+
+PC가 유선 LAN을 쓰고 아이폰이 같은 LAN의 Wi-Fi에 연결되어 있어도 됩니다. USB로 신뢰한 폰에 IP로는 접속할 수 있지만 Apple 서비스의 목록에는 나타나지 않는 경우([이슈 #2](https://github.com/HyunSeob/iphone-cli/issues/2)), 주소를 직접 등록할 수 있습니다. 이 경로는 멀티캐스트 발견이나 LAN 전체 검색에 의존하지 않습니다.
+
+```sh
+iph devices                                      # USB 연결 상태에서 UDID 확인
+iph --udid <UDID> connect --ip <아이폰-IP>          # USB를 뺀 뒤 실행
+iph --udid <UDID> read
+```
+
+주소는 아이폰 설정 → Wi-Fi → 네트워크 정보에서 확인합니다. IPv4·IPv6를 지원하며, 링크 로컬 IPv6에는 컴퓨터의 숫자 인터페이스 인덱스가 필요합니다(예: `fe80::1234%12`). 이 컴퓨터의 USB 신뢰 기록과 Apple 기기 연결 서비스가 있어야 합니다.
+
+`connect`는 페어링 세션에서 읽은 UDID가 선택한 폰과 일치할 때만 주소를 저장합니다. 실패하면 이전 주소를 유지하고, 성공하면 기존 상주 프로세스를 종료해 다음 명령이 새 연결을 엽니다. 이후 CLI·MCP·스크립트에서 같은 `--udid`·`IPH_UDID`·설정 파일의 `udid`를 사용하세요. 선택하지 않은 저장 주소를 자동으로 고르지는 않습니다. MCP에서는 `iph_connect`에 `{"ip":"192.168.1.20"}`을 전달합니다. DHCP로 IP가 바뀌면 새 주소를 등록하세요.
+
+`address_saved: true`·`udid_verified: true`는 주소 등록 확인이며 개발자 서비스 준비 완료를 뜻하지 않습니다. `devices`는 페어링된 기기 식별과 메타데이터를 확인해 `ready`를 보고하며, 전체 준비 상태는 `doctor`로 검사합니다. `devices`의 `source`는 선택한 주소 출처, `transport`는 실제 전송(`tcp` 또는 `usbmuxd`), `listed_by_usbmuxd`는 Apple 목록에서 그 UDID를 관측했는지를 나타냅니다. 저장 주소로 연결되었다고 Apple의 무선 발견 목록이 복구된 것은 아닙니다.
+
+자동 검색의 대안으로 이슈 #2에 보고된 [netmuxd](https://github.com/jkcoxson/netmuxd) 0.4.3도 있습니다. 별도 로컬 포트에서 `--plist-storage`로 Apple 페어링 폴더를 지정하고 `--upstream-usbmuxd 127.0.0.1:27015`로 기존 Apple 서비스를 연결한 뒤, `USBMUXD_SOCKET_ADDRESS`를 그 포트로 지정합니다. 이 방법의 자동 검색은 PC에 mDNS가 도달해야 동작합니다.
+
+Wi-Fi 전송·heartbeat·연결 후보 선택은 [연결 동작 원리](how-it-works.md#1-터널과-상주-프로세스), 입력 재전송을 하지 않는 복구 규칙은 [연결과 화면 읽기 복구](how-it-works.md#6-연결과-화면-읽기-복구)를 참고하세요.
 
 ## 결과 해석
 

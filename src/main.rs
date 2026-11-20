@@ -4,7 +4,7 @@ use std::{io::Read, time::Instant};
 
 use clap::{Parser, Subcommand};
 use iphone_cli::{
-    client, clock, daemon, devices, diagnose, events, fields, human,
+    client, clock, connect, daemon, devices, diagnose, events, fields, human,
     mcp,
     reply::{Fail, envelope},
     script, setup,
@@ -38,6 +38,8 @@ struct Cli {
 enum Cmd {
     /// List connected iPhones.
     Devices,
+    /// Verify and save the selected paired iPhone's IP when automatic discovery fails.
+    Connect(connect::Args),
     /// Save connection diagnostics and optional reproduction output for a GitHub issue.
     Diagnose(diagnose::Args),
     /// Walk through the one-time preparation of a phone.
@@ -101,6 +103,23 @@ enum Cmd {
         #[arg(long)]
         drag: bool,
     },
+    /// Pinch in or out, or turn: two fingers around the middle of the screen or a target.
+    Pinch {
+        /// `in` or `out`; or give `--scale` and/or `--rotate` instead.
+        direction: Option<String>,
+        /// End span over start span, 0.25..4 (above 1 spreads the fingers).
+        #[arg(long)]
+        scale: Option<f64>,
+        /// Degrees, positive clockwise, -180..180.
+        #[arg(long, allow_negative_numbers = true)]
+        rotate: Option<f64>,
+        /// A selector or x,y where the fingers meet. Default: the middle of the screen.
+        #[arg(long)]
+        at: Option<String>,
+        /// Milliseconds the fingers move (default 500).
+        #[arg(long)]
+        duration: Option<u64>,
+    },
     /// Scroll the content up or down, optionally until an element shows.
     Scroll {
         direction: String,
@@ -129,6 +148,12 @@ enum Cmd {
         /// Quit it first so it starts from its first screen.
         #[arg(long)]
         restart: bool,
+        /// Environment variable for the app's process, repeatable: --env NAME=value. Starts the app anew.
+        #[arg(long = "env", value_name = "K=V")]
+        env: Vec<String>,
+        /// Launch arguments for the app, after `--`: iph launch <app> -- -key value. Starts the app anew.
+        #[arg(last = true)]
+        arguments: Vec<String>,
     },
     /// List installed apps.
     Apps,
@@ -136,6 +161,16 @@ enum Cmd {
     Screenshot {
         #[arg(short, long)]
         output: Option<String>,
+    },
+    /// Record the screen to an MP4 file while other commands run: start, stop, status.
+    Record {
+        action: String,
+        /// start: the file to write (default: iph-record-<time>.mp4 in this directory).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// start: the display to record (default: the first that shows the screen).
+        #[arg(long)]
+        display: Option<i64>,
     },
     /// Run a JSON array of steps from a file or stdin (-).
     Batch { file: String },
@@ -163,6 +198,43 @@ enum Cmd {
     },
     /// Do Not Disturb on the phone: on, off (back to the Focus that was on), status.
     Dnd { action: String },
+    /// Capture the phone's log while a test runs and read it back: start, read, stop, status.
+    Syslog {
+        action: String,
+        /// start: keep only this process, by executable name (Settings is Preferences). Repeatable.
+        #[arg(long)]
+        process: Vec<String>,
+        /// start: keep only this app's entries, by bundle id or name as `iph launch` takes it. Repeatable; with --process an entry passes if it matches any.
+        #[arg(long)]
+        app: Vec<String>,
+        /// start: keep only this pid (the phone filters it).
+        #[arg(long)]
+        pid: Option<u32>,
+        /// start: lowest level kept: debug, info, notice, error, fault.
+        #[arg(long)]
+        level: Option<String>,
+        /// start: also write the kept entries to this JSON Lines file. Without it nothing is written to disk.
+        #[arg(short, long)]
+        output: Option<String>,
+        /// start, with -o: move the file to <file>.1 when it reaches this size in MiB (1 to 4096, default 64).
+        #[arg(long)]
+        max_mb: Option<u64>,
+        /// start: most entries the buffer holds (1 to 1000000, default 100000). The oldest are dropped.
+        #[arg(long)]
+        buffer_entries: Option<u64>,
+        /// start: most memory the buffer takes in MiB (1 to 1024, default 64).
+        #[arg(long)]
+        buffer_mb: Option<u64>,
+        /// read: only entries after this seq: the `cursor` of the previous read (default: from the oldest kept).
+        #[arg(long)]
+        after: Option<u64>,
+        /// read, stop: only entries whose message matches this regular expression.
+        #[arg(long)]
+        grep: Option<String>,
+        /// read: most entries returned, the oldest first. stop: most entries returned, the latest (default 50, at most 1000).
+        #[arg(long)]
+        max: Option<u64>,
+    },
     /// Stop the background daemon for this phone.
     Stop,
     /// Internal: the resident process.
@@ -224,6 +296,18 @@ fn swipe_args(direction: &str, duration: Option<u64>, drag: bool) -> Result<Valu
     }
     v["drag"] = json!(drag);
     Ok(v)
+}
+
+fn launch_args(app: &str, restart: bool, env: &[String], arguments: &[String]) -> Result<Value, Fail> {
+    let mut environment = serde_json::Map::new();
+    for pair in env {
+        let (name, value) = pair
+            .split_once('=')
+            .filter(|(name, _)| !name.is_empty())
+            .ok_or_else(|| Fail::invalid(format!("--env takes NAME=value, got \"{pair}\"")))?;
+        environment.insert(name.to_string(), json!(value));
+    }
+    Ok(json!({ "app": app, "restart": restart, "arguments": arguments, "environment": environment }))
 }
 
 fn main() {
@@ -292,6 +376,11 @@ async fn run(cli: Cli) -> i32 {
     };
 
     let (cmd, args): (&str, Value) = match cli.command {
+        Cmd::Connect(args) => {
+            let v = envelope(connect::run(&udid, args).await, started);
+            print(&v, human_out, "connect");
+            return exit_code(&v);
+        }
         Cmd::Daemon => {
             return match daemon::run(udid).await {
                 Ok(()) => 0,
@@ -339,6 +428,10 @@ async fn run(cli: Cli) -> i32 {
                 return exit_code(&v);
             }
         },
+        Cmd::Pinch { direction, scale, rotate, at, duration } => (
+            "pinch",
+            json!({ "direction": direction, "scale": scale, "rotate": rotate, "at": at, "duration_ms": duration }),
+        ),
         Cmd::Scroll { direction, until, max } => (
             "scroll",
             json!({ "direction": direction, "until": until, "max": max }),
@@ -349,7 +442,25 @@ async fn run(cli: Cli) -> i32 {
         Cmd::Key { key } => ("key", json!({ "key": key })),
         Cmd::Button { button } => ("button", json!({ "button": button })),
         Cmd::Dnd { action } => ("dnd", json!({ "action": action })),
-        Cmd::Launch { app, restart } => ("launch", json!({ "app": app, "restart": restart })),
+        Cmd::Syslog { action, process, app, pid, level, output, max_mb, buffer_entries, buffer_mb, after, grep, max } => {
+            // The daemon writes the file, so the path must not depend on its cwd.
+            let output = output.map(|o| std::path::absolute(&o).map(|p| p.display().to_string()).unwrap_or(o));
+            let process = (!process.is_empty()).then_some(process);
+            let app = (!app.is_empty()).then_some(app);
+            ("syslog", json!({
+                "action": action, "process": process, "app": app, "pid": pid, "level": level, "output": output,
+                "max_mb": max_mb, "buffer_entries": buffer_entries, "buffer_mb": buffer_mb,
+                "after": after, "grep": grep, "max": max,
+            }))
+        }
+        Cmd::Launch { app, restart, env, arguments } => match launch_args(&app, restart, &env, &arguments) {
+            Ok(v) => ("launch", v),
+            Err(f) => {
+                let v = envelope(Err(f), started);
+                print(&v, human_out, "launch");
+                return exit_code(&v);
+            }
+        },
         Cmd::Apps => ("apps", Value::Null),
         Cmd::Screenshot { output } => {
             let name = output.unwrap_or_else(|| {
@@ -360,6 +471,14 @@ async fn run(cli: Cli) -> i32 {
                 .map(|p| p.display().to_string())
                 .unwrap_or(name);
             ("screenshot", json!({ "path": path }))
+        }
+        Cmd::Record { action, output, display } => {
+            let output = match (action.as_str(), output) {
+                ("start", None) => Some(format!("iph-record-{}.mp4", clock::file_stamp())),
+                (_, output) => output,
+            };
+            let path = output.map(|o| std::path::absolute(&o).map(|p| p.display().to_string()).unwrap_or(o));
+            ("record", json!({ "action": action, "path": path, "display": display }))
         }
         Cmd::Batch { file } => {
             let text = if file == "-" {
@@ -443,4 +562,50 @@ async fn run(cli: Cli) -> i32 {
     let value = client::request(&udid, cmd, args).await;
     print(&value, human_out, cmd);
     exit_code(&value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn launch_env_splits_at_the_first_equals() {
+        let v = launch_args("a", false, &strings(&["TZ=UTC", "TOKEN=a=b", "EMPTY="]), &strings(&["-k", "v"])).unwrap();
+        assert_eq!(v["environment"], json!({"TZ": "UTC", "TOKEN": "a=b", "EMPTY": ""}));
+        assert_eq!(v["arguments"], json!(["-k", "v"]));
+    }
+
+    #[test]
+    fn syslog_flags_reach_the_command() {
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("iph").chain(args.iter().copied())).unwrap();
+        let Cmd::Syslog { action, after, grep, max, .. } =
+            parse(&["syslog", "read", "--after", "120", "--grep", "row", "--max", "5"]).command
+        else {
+            panic!("syslog read")
+        };
+        assert_eq!((action.as_str(), after, grep.as_deref(), max), ("read", Some(120), Some("row"), Some(5)));
+        let Cmd::Syslog { process, app, output, max_mb, buffer_entries, buffer_mb, .. } = parse(&[
+            "syslog", "start", "--process", "A", "--process", "B", "--app", "com.naver.papago", "--app", "설정",
+            "-o", "cap.jsonl", "--max-mb", "8", "--buffer-entries", "500", "--buffer-mb", "2",
+        ])
+        .command
+        else {
+            panic!("syslog start")
+        };
+        assert_eq!((process, app), (strings(&["A", "B"]), strings(&["com.naver.papago", "설정"])));
+        assert_eq!((output.as_deref(), max_mb, buffer_entries, buffer_mb), (Some("cap.jsonl"), Some(8), Some(500), Some(2)));
+    }
+
+    #[test]
+    fn launch_env_without_a_name_or_equals_is_not_sent() {
+        for bad in ["NOEQUALS", "=v", ""] {
+            let f = launch_args("a", false, &strings(&[bad]), &[]).unwrap_err();
+            assert_eq!(f.code, "invalid_argument");
+        }
+    }
 }

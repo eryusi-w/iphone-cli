@@ -332,14 +332,18 @@ async fn snapshot(phase: &str, chosen: &mut Option<String>, probe: bool) -> Valu
         Ok(value) => json!({ "ok": true, "response": value }),
         Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
     };
-    let devices = match conn::list_raw().await {
-        Ok(devices) => devices,
+    let (discovered, listing_error) = match crate::device::discovery::read().await {
+        Ok(devices) => (devices, None),
         Err(error) => {
-            out["listing"] = json!({ "ok": false, "error": format!("{error:#}") });
-            return out;
+            let error = format!("{error:#}");
+            out["listing"] = json!({ "ok": false, "error": error });
+            (crate::device::discovery::Discovery::default(), Some(error))
         }
     };
-    out["listing"] = json!({ "ok": true, "devices": conn::describe_raw(&devices) });
+    let devices: Vec<_> = discovered.devices.iter().map(|d| d.mux.clone()).collect();
+    if listing_error.is_none() {
+        out["listing"] = json!({ "ok": true, "devices": conn::describe_raw(&devices), "warnings": discovered.warnings });
+    }
     if chosen.is_none() {
         let ids: BTreeSet<_> = devices.iter().map(|d| d.udid.clone()).collect();
         if ids.len() == 1 {
@@ -359,34 +363,35 @@ async fn snapshot(phase: &str, chosen: &mut Option<String>, probe: bool) -> Valu
         out["probe_note"] = json!("Active probes deferred until after the reproduction command");
         return out;
     }
-    for device in devices.iter().filter(|d| &d.udid == udid) {
-        let addr = match conn::mux_addr() {
-            Ok(addr) => addr,
+    for device in discovered.devices.iter().filter(|d| &d.mux.udid == udid) {
+        let route = match conn::route_device(device).await {
+            Ok(route) => route,
             Err(e) => {
-                out["error"] = json!(format!("{e:#}"));
-                return out;
+                out["probes"].as_array_mut().unwrap().push(json!({ "connection": conn::conn_name(&device.mux.connection_type), "error": format!("{e:#}") }));
+                continue;
             }
         };
-        let provider = device.to_provider(addr, conn::LABEL);
-        let mut probe =
-            probe_provider(udid, conn::conn_name(&device.connection_type), &provider).await;
-        if let idevice::usbmuxd::Connection::Network(ip) = device.connection_type {
-            if matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local()) {
-                probe["direct_tcp"] = json!({ "status": "skipped", "reason": "usbmuxd's parsed address omits the IPv6 scope; see the raw NetworkAddress and Bonjour interface probes" });
-            } else {
-                probe["direct_tcp"] = tcp_probe(SocketAddr::new(ip, 62078)).await;
-            }
+        let mut probe = probe_provider(udid, &route.connection, &*route.provider).await;
+        probe["transport"] = json!(if route.address.is_some() { "tcp" } else { "usbmuxd" });
+        if let Some(address) = route.address {
+            probe["direct_tcp"] = tcp_probe(address.socket_addr(62078)).await;
         }
         out["probes"].as_array_mut().unwrap().push(probe);
     }
     // A known phone can still be reachable at its cached address when the
     // system temporarily omits it. Record that route separately from discovery.
-    if out["probes"].as_array().unwrap().is_empty() {
-        match conn::route(udid).await {
-            Ok(route) => out["probes"]
-                .as_array_mut()
-                .unwrap()
-                .push(probe_provider(udid, "cached_wifi", &*route.provider).await),
+    if out["probes"].as_array().unwrap().iter().all(|p| p.get("transport").is_none()) {
+        let found = match listing_error {
+            Some(error) => Err(anyhow::anyhow!(error)),
+            None => Ok(discovered),
+        };
+        match conn::route_from(udid, found).await {
+            Ok(route) => {
+                let mut probe = probe_provider(udid, &route.connection, &*route.provider).await;
+                probe["source"] = json!(route.source);
+                probe["transport"] = json!(if route.address.is_some() { "tcp" } else { "usbmuxd" });
+                out["probes"].as_array_mut().unwrap().push(probe);
+            }
             Err(e) => out["route_error"] = json!(format!("{e:#}")),
         }
     }

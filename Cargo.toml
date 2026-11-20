@@ -1,11 +1,14 @@
 [package]
 name = "iphone-cli"
-version = "0.1.3"
+version = "0.1.9"
 edition = "2024"
 license = "MIT"
 description = "Let AI agents read and operate any app on a real iPhone through the accessibility tree. No XCUITest, WebDriverAgent or Xcode signing."
 repository = "https://github.com/HyunSeob/iphone-cli"
+homepage = "https://hyunseob.github.io/iphone-cli/"
 readme = "README.md"
+keywords = ["iphone", "ios", "mcp", "ai-agent", "automation"]
+categories = ["command-line-utilities", "development-tools", "accessibility"]
 
 [lib]
 name = "iphone_cli"
@@ -32,6 +35,7 @@ idevice = { version = "=0.1.68", features = [
   "heartbeat",
   "installation_proxy",
   "screenshotr",
+  "syslog_relay",
 ] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
@@ -50,6 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rquickjs = "0.14"
 sha2 = "0.10"
+shiguredo_mp4 = "2026.5.0"
 # The tunnel's TCP stack (src/tcp, from jktcp).
 rand = "0.9"
 

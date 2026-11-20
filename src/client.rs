@@ -40,8 +40,8 @@ pub async fn resolve_udid(flag: Option<String>) -> Result<String, Fail> {
     match devices.len() {
         1 => Ok(devices[0].udid.clone()),
         0 => Err(Fail::not_sent("no_device", "no iPhone is connected").hint(t(
-            "폰을 USB로 연결하거나 컴퓨터와 같은 Wi-Fi에 두고 화면을 켜 주세요. 처음이라면 `iph setup`을 실행하세요.",
-            "Plug the phone in, or put it on the computer's Wi-Fi and wake it. First time? Run `iph setup`.",
+            "폰을 USB로 연결하거나 컴퓨터와 같은 LAN에 두고 화면을 켜 주세요. USB로 신뢰한 폰이 검색되지 않으면 `iph --udid <UDID> connect --ip <폰 IP>`로 주소를 검증·저장하세요. 처음이라면 `iph setup`을 실행하세요.",
+            "Plug the phone in, or put it on the same LAN and wake it. For a USB-paired phone missing from discovery, verify and save its address with `iph --udid <UDID> connect --ip <phone IP>`. First time? Run `iph setup`.",
         ))),
         n => Err(Fail::not_sent(
             "multiple_devices",

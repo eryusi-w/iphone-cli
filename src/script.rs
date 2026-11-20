@@ -32,7 +32,7 @@ use crate::{
     fields,
     i18n::t,
     paths,
-    reply::{Fail, Outcome, Res, envelope},
+    reply::{Fail, Fields, Outcome, Res, envelope},
     selector::Selector,
 };
 
@@ -135,6 +135,7 @@ const PRELUDE: &str = r#"
   g.find = (selector, o) => call("find", { ...opts(o), selector });
   g.tap = (target, o) => call("tap", { ...opts(o), target });
   g.swipe = (how, o) => call("swipe", typeof how === "string" ? { ...opts(o), direction: how } : { ...opts(o), ...opts(how) });
+  g.pinch = (how, o) => call("pinch", typeof how === "string" ? { ...opts(o), direction: how } : { ...opts(o), ...opts(how) });
   g.scroll = (direction, o) => call("scroll", { ...opts(o), direction });
   g.type = (value, o) => call("type", { ...opts(o), text: String(value) });
   g.key = (name, o) => call("key", { ...opts(o), key: name });
@@ -144,6 +145,8 @@ const PRELUDE: &str = r#"
   g.waitFor = (selector, o) => call("wait_for", { ...opts(o), selector });
   g.readField = (spec) => call("read_field", opts(spec)).value;
   g.readList = (spec) => call("read_list", opts(spec));
+  g.syslog = (action, o) => call("syslog", { ...opts(o), action });
+  g.record = (action, o) => call("record", { ...opts(o), action });
   g.sleep = (ms) => { __sleep(Number(ms) || 0); };
   g.log = (...xs) => { __emit("log", "", xs.map(text).join(" ")); };
   g.output = (key, value) => { __emit("output", String(key), JSON.stringify(value === undefined ? null : value)); };
@@ -429,11 +432,11 @@ pub async fn run<H: ScriptHost>(host: &mut H, code: &str, args: &Map<String, Val
 // ---------------------------------------------------------------------------
 
 /// Calls that send input to the phone.
-const INPUTS: [&str; 8] = ["launch", "tap", "swipe", "scroll", "type", "key", "button", "read_list"];
+const INPUTS: [&str; 9] = ["launch", "tap", "swipe", "pinch", "scroll", "type", "key", "button", "read_list"];
 /// Calls that may send several inputs before they fail.
 const MANY_INPUTS: [&str; 2] = ["scroll", "read_list"];
 /// Calls that act on the app the script launched, and so need it in front.
-const NEEDS_APP: [&str; 8] = ["tap", "swipe", "scroll", "type", "key", "button", "read_field", "read_list"];
+const NEEDS_APP: [&str; 9] = ["tap", "swipe", "pinch", "scroll", "type", "key", "button", "read_field", "read_list"];
 
 /// A call's arguments after the run's rules have been applied.
 #[derive(Debug)]
@@ -450,6 +453,10 @@ pub struct RunState {
     pub expected_pid: Option<i64>,
     /// The call after which the run may not go on, and its result.
     pub unknown: Option<(String, Value)>,
+    /// The action of the `record` call being made.
+    record_action: Option<String>,
+    /// The run started a recording it has not stopped; the run's end stops it.
+    pub owns_recording: bool,
 }
 
 impl RunState {
@@ -458,6 +465,17 @@ impl RunState {
         let Value::Object(mut map) = args else {
             return Err(Fail::invalid(format!("`{cmd}` takes an object of arguments")));
         };
+        if cmd == "syslog" && map.get("output").is_some_and(|v| !v.is_null()) {
+            // Saved scripts come from anywhere; they do not get to write files.
+            return Err(Fail::invalid("a script cannot write a file; read the log back with syslog(\"read\")"));
+        }
+        if cmd == "record" && map.contains_key("path") {
+            // Saved scripts come from anywhere; the file stays where iph keeps its own.
+            return Err(Fail::invalid("a script cannot choose the file; the recording goes to iph's state directory"));
+        }
+        if cmd == "record" {
+            self.record_action = map.get("action").and_then(|v| v.as_str()).map(String::from);
+        }
         let hint = map.remove("hint").and_then(|v| v.as_str().map(String::from));
         Ok(Prepared { args: Value::Object(map), hint })
     }
@@ -475,6 +493,13 @@ impl RunState {
         }
         if outcome == "unknown" {
             self.unknown = Some((cmd.to_string(), result.clone()));
+        }
+        if cmd == "record" {
+            match self.record_action.take().as_deref() {
+                Some("start") if result["ok"] == true => self.owns_recording = true,
+                Some("stop") => self.owns_recording = false,
+                _ => {}
+            }
         }
     }
 }
@@ -588,6 +613,18 @@ pub fn finish(ended: Ended, state: &RunState) -> Res {
         .with("inputs_sent", sent))
 }
 
+/// The run's result with the report of the recording its end stopped.
+fn with_recording(res: Res, recording: Option<Res<Fields>>) -> Res {
+    let Some(report) = recording.map(|r| Value::Object(crate::record::report_fields(r))) else { return res };
+    match res {
+        Ok(mut out) => {
+            out.insert("recording".into(), report);
+            Ok(out)
+        }
+        Err(f) => Err(f.with("recording", report)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The real phone
 // ---------------------------------------------------------------------------
@@ -624,10 +661,8 @@ impl PhoneHost<'_> {
     }
 
     async fn dispatch(&mut self, cmd: &str, args: Value) -> Res {
-        if NEEDS_APP.contains(&cmd)
-            && let Some(f) = self.session.unexpected_app(self.state.expected_pid)
-        {
-            return Err(f);
+        if NEEDS_APP.contains(&cmd) {
+            Box::pin(self.session.check_expected_app(self.state.expected_pid)).await?;
         }
         match cmd {
             "read" => Box::pin(self.session.cmd_read(parse_args(&args)?)).await,
@@ -642,10 +677,11 @@ impl PhoneHost<'_> {
                 Ok(r)
             }
             "tap" => self.tap(args).await,
-            "swipe" | "scroll" | "type" | "key" | "button" | "read_list" => {
+            "swipe" | "pinch" | "scroll" | "type" | "key" | "button" | "read_list" => {
                 let s = &mut *self.session;
                 match cmd {
                     "swipe" => Box::pin(s.cmd_swipe(parse_args(&args)?)).await,
+                    "pinch" => Box::pin(s.cmd_pinch(parse_args(&args)?)).await,
                     "scroll" => Box::pin(s.cmd_scroll(parse_args(&args)?)).await,
                     "type" => Box::pin(s.cmd_type(parse_args(&args)?)).await,
                     "key" => Box::pin(s.cmd_key(parse_args(&args)?)).await,
@@ -667,8 +703,10 @@ impl PhoneHost<'_> {
                 let (_, value) = Box::pin(self.session.read_field(&args)).await?;
                 Ok(fields! { "value": value })
             }
+            "syslog" => Box::pin(self.session.cmd_syslog(&args)).await,
+            "record" => Box::pin(self.session.cmd_record(&args)).await,
             other => Err(Fail::invalid(format!(
-                "a script has no `{other}` (read, find, tap, swipe, scroll, type, key, button, launch, apps, waitFor, readField, readList)"
+                "a script has no `{other}` (read, find, tap, swipe, pinch, scroll, type, key, button, launch, apps, waitFor, readField, readList, syslog, record)"
             ))),
         }
     }
@@ -700,7 +738,7 @@ impl ScriptHost for PhoneHost<'_> {
 
     fn cut_off(&mut self, cmd: &str) {
         // Whatever was in flight is abandoned with its connections.
-        self.session.reset();
+        self.session.reset(&format!("the script ran out of time during `{cmd}`"));
         if INPUTS.contains(&cmd) {
             self.state.inputs_sent += 1;
         }
@@ -733,14 +771,21 @@ impl Session {
         let mut host = PhoneHost { session: self, state: RunState::default() };
         let ended = run(&mut host, code, args, &limits).await;
         let PhoneHost { session, state } = host;
-        finish(ended, &state).map_err(|mut f| {
+        // A recording the script started and did not stop ends with it,
+        // even when it threw.
+        let recording = match state.owns_recording {
+            true => session.collect_recording("the script ended").await,
+            false => None,
+        };
+        let res = finish(ended, &state).map_err(|mut f| {
             if !f.extra.contains_key("screen_summary")
                 && let Some(seen) = session.last_seen()
             {
                 f = f.with("screen_summary", seen);
             }
             f
-        })
+        });
+        with_recording(res, recording)
     }
 
     /// Serve a `script` request (see [`request`]).
@@ -852,6 +897,7 @@ mod tests {
             type("안녕", {submit: true}); key("return"); button("home");
             launch("com.apple.Preferences", {restart: true});
             find("label~=일"); waitFor("일반", {timeout_ms: 100});
+            pinch("out"); pinch({scale: 1.5, rotate: -30, at: "지도"}, {duration_ms: 300});
         "#;
         let (res, _) = go(&mut fake, code, json!({}), limits());
         res.unwrap();
@@ -864,7 +910,99 @@ mod tests {
         assert_eq!(asked[5], ("type", &json!({"submit": true, "text": "안녕"})));
         assert_eq!(asked[8], ("launch", &json!({"restart": true, "app": "com.apple.Preferences"})));
         assert_eq!(asked[10], ("wait_for", &json!({"timeout_ms": 100, "selector": "일반"})));
-        assert_eq!(fake.state.inputs_sent, 9);
+        assert_eq!(asked[11], ("pinch", &json!({"direction": "out"})));
+        assert_eq!(asked[12], ("pinch", &json!({"scale": 1.5, "rotate": -30, "at": "지도", "duration_ms": 300})));
+        assert_eq!(fake.state.inputs_sent, 11);
+    }
+
+    #[test]
+    fn launch_passes_arguments_and_environment_on() {
+        let mut fake = Fake::default();
+        let code = r#"launch("a.b", {arguments: ["-AppleLanguages", "(ko)"], environment: {TZ: "UTC"}});"#;
+        let (res, _) = go(&mut fake, code, json!({}), limits());
+        res.unwrap();
+        assert_eq!(
+            fake.asked[0],
+            ("launch".to_string(), json!({"arguments": ["-AppleLanguages", "(ko)"], "environment": {"TZ": "UTC"}, "app": "a.b"}))
+        );
+    }
+
+    #[test]
+    fn syslog_is_not_an_input_reads_with_a_cursor_and_cannot_write_a_file() {
+        let mut fake = Fake::default();
+        let code = r#"
+            syslog("start", {process: ["Preferences"], level: "info"});
+            tap("일반");
+            const page = syslog("read", {after: 0, grep: "row", max: 5});
+            tap("정보");
+            syslog("read", {after: page.cursor});
+            const done = syslog("stop", {grep: "row", max: 5});
+            let refused = null;
+            try { syslog("start", {output: "/tmp/elsewhere.jsonl"}); } catch (e) { refused = e.code; }
+            return { refused };
+        "#;
+        let (res, _) = go(&mut fake, code, json!({}), limits());
+        let out = res.unwrap();
+        let asked: Vec<(&str, &Value)> = fake.asked.iter().map(|(c, a)| (c.as_str(), a)).collect();
+        assert_eq!(asked[0], ("syslog", &json!({"process": ["Preferences"], "level": "info", "action": "start"})));
+        assert_eq!(asked[2], ("syslog", &json!({"after": 0, "grep": "row", "max": 5, "action": "read"})));
+        assert_eq!(asked[4].0, "syslog");
+        assert_eq!(asked[4].1["action"], "read");
+        assert_eq!(asked[5], ("syslog", &json!({"grep": "row", "max": 5, "action": "stop"})));
+        assert_eq!(asked.len(), 6, "the refused start never reached the phone");
+        assert_eq!(out["outputs"]["refused"], "invalid_argument");
+        assert_eq!(out["inputs_sent"], 2);
+    }
+
+    #[test]
+    fn a_script_may_pass_a_null_output() {
+        let mut run = RunState::default();
+        assert!(run.prepare("syslog", json!({"action": "start", "output": null})).is_ok());
+        assert!(run.prepare("syslog", json!({"action": "start", "output": "/tmp/x.jsonl"})).is_err());
+    }
+
+    #[test]
+    fn record_is_not_an_input_and_cannot_choose_its_file() {
+        let mut fake = Fake::default();
+        let code = r#"
+            record("start", {display: 0});
+            tap("일반");
+            const done = record("stop");
+            let refused = null;
+            try { record("start", {path: "/tmp/elsewhere.mp4"}); } catch (e) { refused = e.code; }
+            return { refused };
+        "#;
+        let (res, _) = go(&mut fake, code, json!({}), limits());
+        let out = res.unwrap();
+        let asked: Vec<(&str, &Value)> = fake.asked.iter().map(|(c, a)| (c.as_str(), a)).collect();
+        assert_eq!(asked[0], ("record", &json!({"display": 0, "action": "start"})));
+        assert_eq!(asked[2], ("record", &json!({"action": "stop"})));
+        assert_eq!(asked.len(), 3, "the refused start never reached the phone");
+        assert_eq!(out["outputs"]["refused"], "invalid_argument");
+        assert_eq!(out["inputs_sent"], 1);
+    }
+
+    #[test]
+    fn a_recording_the_script_started_and_left_running_is_its_to_end() {
+        let started = |code: &str| {
+            let mut fake = Fake::default();
+            let _ = go(&mut fake, code, json!({}), limits());
+            fake.state.owns_recording
+        };
+        assert!(started(r#"record("start"); throw new Error("boom");"#), "a throw leaves it to the run's end");
+        assert!(started(r#"record("start"); tap("일반");"#));
+        assert!(!started(r#"record("start"); record("stop");"#));
+        assert!(!started(r#"record("status");"#), "a recording someone else started is not the script's");
+        let mut refused = Fake::default();
+        refused.answers.insert("record".into(), json!({"ok": false, "outcome": "not_sent", "error": {"code": "recording_running"}}));
+        let _ = go(&mut refused, r#"try { record("start"); } catch (e) {}"#, json!({}), limits());
+        assert!(!refused.state.owns_recording, "a start that was refused started nothing");
+
+        let report = Some(Ok(fields! { "state": "stopped", "ended_reason": "the script ended" }));
+        assert_eq!(with_recording(Ok(fields! { "outputs": {} }), report.clone()).unwrap()["recording"]["state"], "stopped");
+        let failed = with_recording(Err(Fail::invalid("boom")), report).unwrap_err();
+        assert_eq!(failed.extra["recording"]["ended_reason"], "the script ended");
+        assert!(with_recording(Ok(Fields::new()), None).unwrap().get("recording").is_none());
     }
 
     #[test]
@@ -889,6 +1027,18 @@ mod tests {
         let code = "try { tap('x') } catch (e) { output('code', e.code); output('outcome', e.outcome) }\nreturn { after: read().ok }";
         let (res, _) = go(&mut fake, code, json!({}), limits());
         assert_eq!(res.unwrap()["outputs"], json!({"code": "not_found", "outcome": "not_sent", "after": true}));
+    }
+
+    #[test]
+    fn a_pinch_counts_as_input_so_a_later_failure_is_unknown() {
+        let not_found = json!({"ok": false, "outcome": "not_sent", "error": {"code": "not_found", "message": "no element matches"}});
+        let mut fake = Fake::default();
+        fake.answers.insert("tap".into(), not_found);
+        let (res, _) = go(&mut fake, "pinch('out');\ntap('no such label');", json!({}), limits());
+        let f = res.unwrap_err();
+        assert_eq!((f.code.as_str(), f.outcome), ("script_failed", Outcome::Unknown));
+        assert_eq!(f.extra["inputs_sent"], 1);
+        assert!(NEEDS_APP.contains(&"pinch"));
     }
 
     #[test]

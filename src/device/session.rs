@@ -12,6 +12,7 @@ use idevice::{
         AppListEntry, AppServiceClient, ImageFormat, PasteboardServiceClient,
         ScreenCaptureServiceClient,
     },
+    os_trace_relay::{OsTraceRelayClient, OsTraceRelayReceiver},
 };
 
 use crate::{
@@ -24,20 +25,23 @@ use crate::{
         ax::{ANSWER_AT_LEAST, AxSub},
         conn::{self, Tunnel},
         input::InputSession,
+        media::{self, MediaControl},
     },
     i18n::t,
     reply::{Fail, Res},
+    tcp::handle::Reset,
 };
 
 const APP_SERVICE: &str = "com.apple.coredevice.appservice";
 
 /// One touch or button gesture, in normalized HID coordinates.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Gesture {
     Tap { x: u16, y: u16, hold: Duration },
     DoubleTap { x: u16, y: u16 },
     Drag { from: (u16, u16), to: (u16, u16), duration: Duration, motion: crate::device::input::Motion },
     Button { page: u64, usage: u64, hold: Duration },
+    Pinch(crate::device::pinch::Plan),
 }
 
 /// How fresh a reading must be.
@@ -73,6 +77,14 @@ const AX_RESTART_GAP: Duration = Duration::from_secs(120);
 /// Shortest time between the end of one input session and the start of the
 /// next.
 const REOPEN_GAP: Duration = Duration::from_millis(2000);
+/// Longest a housekeeping tick waits for the phone's display service to
+/// answer a new connection.
+const REAP_CONNECT: Duration = Duration::from_secs(3);
+/// Longest a housekeeping tick spends stopping a session's leftover streams:
+/// the connection and one whole stop, `stopAll` fallback included.
+const REAP_WITHIN: Duration = REAP_CONNECT.saturating_add(media::STOP_WITHIN);
+/// Longest the daemon's exit spends stopping leftover streams.
+const SHUTDOWN_REAP_WITHIN: Duration = Duration::from_secs(20);
 const SECOND_PASS_WAIT: Duration = Duration::from_millis(2500);
 
 /// How the phone's accessibility daemon failed a reading, when that calls
@@ -128,6 +140,11 @@ pub struct Session {
     /// because it had stopped answering.
     pub ax_restarts: u64,
     ax_restarted_at: Option<Instant>,
+    /// `iph record`: the recording, with its own media stream.
+    pub recorder: crate::record::Recorder,
+    /// Not before this are leftover streams (`reap_media`) tried again,
+    /// after a try that left one running.
+    reap_after: Option<Instant>,
     /// The daemon was ended and the one the phone started in its place did
     /// not answer either, or it could not be ended. It is not ended again
     /// until a reading comes back: on 2026-11-12, after about six ends in
@@ -142,10 +159,12 @@ pub struct Session {
     system_in_front: bool,
     /// Do Not Disturb: whether it is on for this session and what to put back.
     pub dnd: crate::dnd::State,
+    /// `iph syslog`: the log capture, running or ended and not yet stopped.
+    pub capture: Option<crate::syslog::Capture>,
 }
 
 /// A file URL or path as a plain path without a trailing slash.
-fn plain_path(s: &str) -> String {
+pub(crate) fn plain_path(s: &str) -> String {
     let s = s.strip_prefix("file://").unwrap_or(s);
     let raw = s.as_bytes();
     let mut bytes = Vec::with_capacity(raw.len());
@@ -188,7 +207,7 @@ fn is_transport_error(msg: &str) -> bool {
 }
 
 /// Bound a device call that has no time limit of its own.
-async fn bounded<T, E: std::fmt::Debug>(
+pub(crate) async fn bounded<T, E: std::fmt::Debug>(
     what: &str,
     secs: u64,
     fut: impl std::future::Future<Output = Result<T, E>>,
@@ -209,6 +228,8 @@ impl Session {
             tunnel: None,
             ax: None,
             input: None,
+            recorder: crate::record::Recorder::Idle,
+            reap_after: None,
             input_used: Instant::now(),
             input_closed_at: None,
             input_suspect: false,
@@ -222,6 +243,7 @@ impl Session {
             ax_restart_unhelpful: false,
             system_in_front: false,
             dnd,
+            capture: None,
         }
     }
 
@@ -259,15 +281,34 @@ impl Session {
         }
     }
 
-    /// Drop every connection. The next request builds them again.
-    pub fn reset(&mut self) {
+    /// Drop every connection, and end a recording, because of `cause`. The
+    /// next request builds them again.
+    pub fn reset(&mut self, cause: &str) {
+        // Its stream runs on the tunnel being dropped.
+        self.end_capture(&format!("the connection to the phone was reset: {cause}"));
         let tunnel = self.tunnel.take();
         if let Some(input) = self.input.take() {
             self.input_closed_at = Some(Instant::now());
-            // The tunnel stays until the stream has been told to stop.
-            self.abandoned.push((input, tunnel));
+            self.abandoned.push((input, None));
         }
+        // The tunnel stays until the stream has been told to stop.
+        if let Some(last) = self.abandoned.last_mut().filter(|(_, t)| t.is_none()) {
+            last.1 = tunnel;
+        }
+        // Its video is stopped once a tunnel is up again (`reap_media`).
+        drop(self.recorder.end(&format!("the connection to the phone was reset: {cause}")));
         self.ax = None;
+    }
+
+    /// The accessibility connection closed. A recording keeps the tunnel
+    /// its video crosses, and only that connection is made again.
+    fn ax_closed(&mut self) {
+        self.refresh_connection();
+        if self.recorder.is_recording() {
+            self.ax = None;
+        } else {
+            self.reset("the accessibility connection closed");
+        }
     }
 
     /// Tell the phone to stop the streams of abandoned input sessions. Left
@@ -280,11 +321,45 @@ impl Session {
         }
     }
 
+    /// Stop the streams of one session the marker names and nothing here
+    /// owns: from a start cut off, a stop that failed, a closed tunnel, or a
+    /// killed iph. For housekeeping only: it holds the session for up to
+    /// `REAP_WITHIN`.
+    pub(crate) async fn reap_media(&mut self) {
+        if self.reap_after.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        let Some(tunnel) = self.tunnel.as_ref() else { return };
+        let marker = crate::paths::media_session(&self.udid);
+        let live: Vec<String> = self.input.iter().map(InputSession::session_id).chain(self.recorder.session_id()).collect();
+        let Some(id) = media::next_leftover(&marker, &live) else { return };
+        let stopped = tokio::time::timeout(REAP_WITHIN, async {
+            MediaControl::connect(&tunnel.adapter, &tunnel.rsd).await?.stop_own(&id, &marker).await
+        })
+        .await;
+        crate::device::ax::trace(|| match &stopped {
+            Ok(Ok(())) => format!("media: streams of session {id} stopped"),
+            other => format!("media: streams of session {id} still running: {other:?}"),
+        });
+        // Struck: the next one goes at the next tick.
+        self.reap_after = (!matches!(stopped, Ok(Ok(())))).then(|| Instant::now() + Duration::from_secs(30));
+    }
+
     pub fn connection(&self) -> Option<&str> {
         self.tunnel.as_ref().map(|t| t.connection.as_str())
     }
 
+    /// Only invalidate cached connections; commands decide what to do next.
+    /// No input is replayed when a Wi-Fi heartbeat ends.
+    pub(crate) fn refresh_connection(&mut self) {
+        if let Some(why) = self.tunnel.as_ref().and_then(Tunnel::closed) {
+            crate::events::record("connection", "closed", 0, serde_json::json!({ "udid": self.udid, "reason": why }));
+            self.reset(why);
+        }
+    }
+
     pub async fn ensure_tunnel(&mut self) -> Res<&mut Tunnel> {
+        self.refresh_connection();
         if self.tunnel.is_none() {
             // One tunnel at a time: let go of an abandoned one first.
             self.sweep().await;
@@ -321,9 +396,9 @@ impl Session {
     }
 
     async fn ensure_ax(&mut self) -> Res<()> {
+        self.refresh_connection();
         if self.ax.as_ref().is_some_and(|a| a.is_closed()) {
-            // The accessibility connection died; the tunnel may be gone too.
-            self.reset();
+            self.ax_closed();
         }
         if self.ax.is_none() {
             let mut last = None;
@@ -336,10 +411,10 @@ impl Session {
                         return Ok(());
                     }
                     Err(e) => {
-                        last = Some(e);
                         if attempt == 0 {
-                            self.reset();
+                            self.reset(&e);
                         }
+                        last = Some(e);
                     }
                 }
             }
@@ -453,7 +528,7 @@ impl Session {
             let Some((seq, dump)) = got else {
                 if self.ax.as_ref().is_some_and(|a| a.is_closed()) && reconnects < 2 {
                     reconnects += 1;
-                    self.reset();
+                    self.ax_closed();
                     continue;
                 }
                 let (empty, unparsed) = match (self.ax.as_ref(), base) {
@@ -615,6 +690,7 @@ impl Session {
     pub async fn ensure_input(&mut self) -> Res<&mut InputSession> {
         // A media stream that stopped delivering packets no longer holds the
         // phone's HID gate open.
+        self.refresh_connection();
         let stale = self
             .input
             .as_ref()
@@ -646,9 +722,10 @@ impl Session {
             let mut last = String::new();
             for attempt in 0..2 {
                 let video = self.config.daemon.screen_video;
+                let marker = crate::paths::media_session(&self.udid);
                 let tunnel = self.ensure_tunnel().await?;
                 let mut adapter = tunnel.adapter.clone();
-                match bounded("input session", 20, InputSession::open(&mut adapter, &mut tunnel.rsd, video)).await {
+                match bounded("input session", 20, InputSession::open(&mut adapter, &mut tunnel.rsd, video, marker)).await {
                     Ok(s) => {
                         self.input = Some(s);
                         break;
@@ -656,7 +733,7 @@ impl Session {
                     Err(e) => {
                         last = e;
                         if attempt == 0 && is_transport_error(&last) {
-                            self.reset();
+                            self.reset(&last);
                         } else {
                             break;
                         }
@@ -684,11 +761,12 @@ impl Session {
         for attempt in 0..2 {
             let input = self.ensure_input().await?;
             let before = input.reports_sent();
-            let sent = match gesture {
-                Gesture::Tap { x, y, hold } => input.tap(x, y, hold).await,
-                Gesture::DoubleTap { x, y } => input.double_tap(x, y).await,
-                Gesture::Drag { from, to, duration, motion } => input.drag(from, to, duration, motion).await,
-                Gesture::Button { page, usage, hold } => input.button(page, usage, hold).await,
+            let sent = match &gesture {
+                Gesture::Tap { x, y, hold } => input.tap(*x, *y, *hold).await,
+                Gesture::DoubleTap { x, y } => input.double_tap(*x, *y).await,
+                Gesture::Drag { from, to, duration, motion } => input.drag(*from, *to, *duration, *motion).await,
+                Gesture::Button { page, usage, hold } => input.button(*page, *usage, *hold).await,
+                Gesture::Pinch(plan) => input.pinch(plan).await,
             };
             let Err(e) = sent else {
                 return Ok(());
@@ -740,14 +818,31 @@ impl Session {
     }
 
     pub async fn shutdown(&mut self) {
+        if let Some(video) = self.recorder.end("the daemon stopped") {
+            video.stop().await;
+        }
         if let Some(s) = self.input.take() {
             s.close().await;
         }
         self.sweep().await;
-        self.reset();
+        // A reset leaves a recording's video with no tunnel to stop it over,
+        // and the phone keeps it for its RTCP timeout, an hour.
+        let leftovers = media::marked(&crate::paths::media_session(&self.udid)).len();
+        if leftovers > 0 {
+            let _ = tokio::time::timeout(SHUTDOWN_REAP_WITHIN, async {
+                if self.ensure_tunnel().await.is_ok() {
+                    for _ in 0..leftovers {
+                        self.reap_after = None;
+                        self.reap_media().await;
+                    }
+                }
+            })
+            .await;
+        }
+        self.reset("the daemon stopped");
     }
 
-    async fn rsd_client<T>(&mut self) -> Res<T>
+    pub(crate) async fn rsd_client<T>(&mut self) -> Res<T>
     where
         T: RsdService,
     {
@@ -760,7 +855,7 @@ impl Session {
                 Err(e) => {
                     last = e;
                     if attempt == 0 && is_transport_error(&last) {
-                        self.reset();
+                        self.reset(&last);
                     } else {
                         break;
                     }
@@ -775,6 +870,34 @@ impl Session {
 
     pub async fn app_service(&mut self) -> Res<AppServiceClient<Box<dyn ReadWrite>>> {
         self.rsd_client().await
+    }
+
+    /// The phone's log stream, filtered to one process when `pid` is given,
+    /// and its reset. Dropped on any path, here or later, the stream resets
+    /// its connection rather than closing it, which would hold the relay for
+    /// the next capture.
+    pub async fn os_trace(&mut self, pid: Option<u32>) -> Res<(OsTraceRelayReceiver, Reset)> {
+        let name = OsTraceRelayClient::rsd_service_name();
+        let unavailable = |e: String| Fail::not_sent("service_unavailable", format!("{name}: {e}"));
+        // As `rsd_client`: a tunnel that died under the session is rebuilt once.
+        let mut attempt = 0;
+        let mut stream = loop {
+            let (mut adapter, port) = self.service_port(&name).await?;
+            match bounded("connect", 12, adapter.connect(port)).await {
+                Ok(stream) => break stream,
+                Err(e) if attempt == 0 && is_transport_error(&e) => {
+                    attempt += 1;
+                    self.reset(&e);
+                }
+                Err(e) => return Err(unavailable(e)),
+            }
+        };
+        let reset = stream.reset_on_drop();
+        let started = match OsTraceRelayClient::from_stream(Box::new(stream)).await {
+            Ok(client) => bounded("start_trace", 12, client.start_trace(pid)).await,
+            Err(e) => Err(format!("{e:?}")),
+        };
+        started.map(|receiver| (receiver, reset)).map_err(unavailable)
     }
 
     pub async fn pasteboard(&mut self) -> Res<PasteboardServiceClient<Box<dyn ReadWrite>>> {

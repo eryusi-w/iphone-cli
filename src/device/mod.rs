@@ -1,7 +1,12 @@
 pub mod ax;
+pub mod address;
+pub(crate) mod discovery;
+pub(crate) mod identity;
 pub mod conn;
 pub mod input;
 pub mod legacy;
+pub mod media;
+pub mod pinch;
 pub mod session;
 pub mod wda;
 pub mod wda_source;

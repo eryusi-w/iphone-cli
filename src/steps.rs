@@ -2,7 +2,7 @@
 //! as `waitFor`, `readField` and `readList`.
 //!
 //! A step is a one-key map. Kinds: `launch`, `wait_for`, `tap`, `type`,
-//! `swipe`, `scroll_until`, `read_field`, `read_list`, `assert`, `button`,
+//! `swipe`, `pinch`, `scroll_until`, `read_field`, `read_list`, `assert`, `button`,
 //! `key`, `sleep`. Any step may add `when: "a == b"` (run the
 //! step only then) and `hint: "…"` (what to tell the person if it fails). A
 //! step that fails stops the run; nothing is guessed.
@@ -16,7 +16,7 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    actions::{self, ButtonArgs, KeyArgs, LaunchArgs, ScrollArgs, SwipeArgs, TapArgs, TypeArgs, brief},
+    actions::{self, ButtonArgs, KeyArgs, LaunchArgs, PinchArgs, ScrollArgs, SwipeArgs, TapArgs, TypeArgs, brief},
     ax::{
         attrs,
         tree::{BuildOptions, Element, Rect, Screen},
@@ -34,6 +34,7 @@ const KINDS: &[&str] = &[
     "tap",
     "type",
     "swipe",
+    "pinch",
     "scroll_until",
     "read_field",
     "read_list",
@@ -1048,6 +1049,19 @@ impl Session {
         ))
     }
 
+    /// Reconnection discards the old accessibility subscription. Re-read before
+    /// using a remembered launch guard, so it cannot silently become a no-op.
+    pub(crate) async fn check_expected_app(&mut self, expected_pid: Option<i64>) -> Res<()> {
+        self.refresh_connection();
+        if expected_pid.is_some() && self.ax.as_ref().is_none_or(|ax| ax.is_closed()) {
+            Box::pin(self.cmd_read(Default::default())).await?;
+        }
+        match self.unexpected_app(expected_pid) {
+            Some(f) => Err(f),
+            None => Ok(()),
+        }
+    }
+
     /// A failure when the latest reading shows another app in front than the
     /// one this run launched (a notification was tapped, a link opened …).
     pub(crate) fn unexpected_app(&self, expected_pid: Option<i64>) -> Option<Fail> {
@@ -1087,7 +1101,7 @@ impl Session {
         match kind {
             "launch" => {
                 let args: LaunchArgs = match body {
-                    Value::String(s) => LaunchArgs { app: s.clone(), restart: false },
+                    Value::String(s) => LaunchArgs { app: s.clone(), ..Default::default() },
                     other => actions::parse_args(other)?,
                 };
                 let app = args.app.clone();
@@ -1164,6 +1178,14 @@ impl Session {
                     other => actions::parse_args(other)?,
                 };
                 let r = Box::pin(self.cmd_swipe(args)).await?;
+                no_value(fields! { "screen_changed": r.get("screen_changed").cloned().unwrap_or(Value::Null) })
+            }
+            "pinch" => {
+                let args: PinchArgs = match body {
+                    Value::String(s) => PinchArgs { direction: Some(s.clone()), ..Default::default() },
+                    other => actions::parse_args(other)?,
+                };
+                let r = Box::pin(self.cmd_pinch(args)).await?;
                 no_value(fields! { "screen_changed": r.get("screen_changed").cloned().unwrap_or(Value::Null) })
             }
             "scroll_until" => {
@@ -1250,7 +1272,7 @@ impl Session {
             // for a moment (a Face ID prompt); every other step needs the app
             // in front.
             if kind != "wait_for"
-                && let Some(f) = self.unexpected_app(expected_pid)
+                && let Err(f) = Box::pin(self.check_expected_app(expected_pid)).await
             {
                 return Err(step_failure(index, raw, f, kind, &records, &outputs, 0));
             }
@@ -1266,7 +1288,7 @@ impl Session {
                     }
                     if matches!(
                         kind,
-                        "launch" | "tap" | "type" | "swipe" | "scroll_until" | "read_list" | "button" | "key"
+                        "launch" | "tap" | "type" | "swipe" | "pinch" | "scroll_until" | "read_list" | "button" | "key"
                     ) {
                         inputs_sent += 1;
                     }
@@ -1311,6 +1333,21 @@ mod tests {
         assert!(split_step(&json!({"tap": "a", "type": "b"})).unwrap_err().contains("exactly one kind"));
         assert!(split_step(&json!({"tap": "a", "hint": "look"})).is_ok());
         assert!(split_step(&json!({"tap": "a", "confirm": true})).is_err());
+        // A recording spans requests; a batch that stops halfway would leave one running.
+        assert!(split_step(&json!({"record": "start"})).unwrap_err().contains("unknown step kind"));
+    }
+
+    #[test]
+    fn a_pinch_step_is_a_kind_and_takes_a_direction_or_its_options() {
+        for step in [json!({"pinch": "out"}), json!({"pinch": {"scale": 1.5, "rotate": 30, "at": "Map", "duration_ms": 300}})] {
+            let (kind, body) = split_step(&step).unwrap();
+            assert_eq!(kind, "pinch");
+            if body.is_object() {
+                assert!(actions::parse_args::<PinchArgs>(body).is_ok());
+            }
+        }
+        let unknown = actions::parse_args::<PinchArgs>(&json!({"zoom": 2})).unwrap_err();
+        assert_eq!((unknown.code.as_str(), unknown.outcome), ("invalid_argument", crate::reply::Outcome::NotSent));
     }
 
     #[test]

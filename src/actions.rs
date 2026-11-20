@@ -1,7 +1,10 @@
 //! The commands themselves, shared by the CLI, the MCP server, `batch` and
 //! scripts. Each takes JSON arguments and returns the fields of its result.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,6 +19,7 @@ use crate::{
     device::{
         ax::trace,
         input::{Motion, normalize},
+        pinch,
         session::{Fresh, Gesture, Session, reuse},
     },
     fields,
@@ -97,6 +101,39 @@ pub struct SwipeArgs {
     pub duration_ms: Option<u64>,
     /// Slow to a stop before lifting (a drag) instead of flicking.
     pub drag: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PinchArgs {
+    /// `in` (scale 0.5) or `out` (scale 2); not with `scale`.
+    pub direction: Option<String>,
+    /// End span over start span, 0.25..4.
+    pub scale: Option<f64>,
+    /// Degrees, positive clockwise, -180..180.
+    pub rotate: Option<f64>,
+    /// Where the fingers meet: a selector, `"x,y"`, or `{x, y}`. Default: the
+    /// middle of the screen.
+    pub at: Value,
+    pub duration_ms: Option<u64>,
+}
+
+impl PinchArgs {
+    /// The `(scale, rotate)` these arguments ask for.
+    fn motion(&self) -> Res<(f64, f64)> {
+        let scale = match (self.direction.as_deref(), self.scale) {
+            (Some(_), Some(_)) => return Err(Fail::invalid("a direction and a scale cannot be combined")),
+            (Some("in"), None) => 0.5,
+            (Some("out"), None) => 2.0,
+            (Some(other), None) => {
+                return Err(Fail::invalid(format!("unknown direction `{other}` (in, out)")));
+            }
+            (None, scale) => scale.unwrap_or(1.0),
+        };
+        let rotate = self.rotate.unwrap_or(0.0);
+        pinch::check_motion(scale, rotate).map_err(Fail::invalid)?;
+        Ok((scale, rotate))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,6 +285,42 @@ pub struct LaunchArgs {
     /// Quit the app first, so it starts from its first screen.
     #[serde(default)]
     pub restart: bool,
+    /// Passed to the app's process, as after `--` in `devicectl device process launch`.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
+
+impl LaunchArgs {
+    pub fn validate(&self) -> Res<()> {
+        for key in self.environment.keys() {
+            if key.is_empty() || key.contains('=') {
+                return Err(Fail::invalid(format!(
+                    "environment names must be non-empty and contain no `=`: \"{key}\""
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Arguments and environment only reach a process that starts now.
+    pub fn has_launch_options(&self) -> bool {
+        !self.arguments.is_empty() || !self.environment.is_empty()
+    }
+
+    pub fn kill_existing(&self) -> bool {
+        self.restart || self.has_launch_options()
+    }
+
+    fn environment_dictionary(&self) -> Option<plist::Dictionary> {
+        (!self.environment.is_empty()).then(|| {
+            self.environment
+                .iter()
+                .map(|(k, v)| (k.clone(), plist::Value::String(v.clone())))
+                .collect()
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +477,39 @@ fn app_changed(before: &Screen, after: &Screen) -> Option<Value> {
     let was: Vec<i64> = before.apps.iter().map(|a| a.pid).collect();
     let now = after.apps.first()?;
     (!was.contains(&now.pid)).then(|| json!({ "name": now.name, "pid": now.pid }))
+}
+
+/// Something with a dot and no spaces is a bundle id; anything else is a name.
+fn is_bundle_id(app: &str) -> bool {
+    app.contains('.') && !app.contains(' ')
+}
+
+/// The bundle id `app` names, looked up by name in `apps` unless it is one already.
+pub(crate) fn bundle_id_in(apps: &[idevice::core_device::AppListEntry], app: &str) -> Res<String> {
+    if is_bundle_id(app) {
+        return Ok(app.to_string());
+    }
+    let want = nfc(app).to_lowercase();
+    let hits: Vec<&idevice::core_device::AppListEntry> = apps
+        .iter()
+        .filter(|a| nfc(&a.name).to_lowercase() == want)
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0].bundle_identifier.clone()),
+        0 => Err(Fail::not_sent("app_not_found", format!("no installed app is named \"{app}\""))
+            .hint(t(
+                "`iph apps`로 이름과 bundle id를 확인하세요.",
+                "See names and bundle ids with `iph apps`.",
+            ))),
+        _ => Err(Fail::not_sent(
+            "ambiguous_app",
+            format!("{} apps are named \"{app}\"", hits.len()),
+        )
+        .with(
+            "candidates",
+            Value::Array(hits.iter().map(|a| json!(a.bundle_identifier)).collect()),
+        )),
+    }
 }
 
 impl Session {
@@ -905,6 +1011,64 @@ impl Session {
         })
     }
 
+    /// Two fingers pinching, spreading or turning around a point. Arguments
+    /// that cannot make a gesture, or a point with no room for one, fail
+    /// before anything is sent. `screen_changed: false` is a fair answer on a
+    /// screen that does not zoom.
+    pub async fn cmd_pinch(&mut self, args: PinchArgs) -> Res {
+        let (scale, rotate) = args.motion()?;
+        let duration = Duration::from_millis(args.duration_ms.unwrap_or(500).clamp(100, 10_000));
+        let target = (!args.at.is_null()).then(|| parse_target(&args.at)).transpose()?;
+        let read = match &target {
+            Some(target) => self.locate_ready(std::slice::from_ref(target)).await.map(|(screen, mut points)| {
+                let (x, y, _) = points.remove(0);
+                (screen, Some((x, y)))
+            }),
+            None => self
+                .screen(Fresh::MaxAge(reuse()), false, BuildOptions::default())
+                .await
+                .map(|(_, screen)| (screen, None)),
+        };
+        let (size, at, before) = match &read {
+            Ok((screen, _)) if screen.width <= 0.0 || screen.height <= 0.0 => {
+                return Err(Fail::not_sent("no_screen_size", "the reading has no application frame"));
+            }
+            Ok((screen, at)) => ((screen.width, screen.height), *at, Some(screen.signature())),
+            Err(read_failed) => {
+                // `unread_size`: only the middle or a point can be pinched without a reading.
+                let size = self.unread_size(read_failed).ok_or_else(|| read_failed.clone())?;
+                let at = match &target {
+                    None => None,
+                    Some(Target::Point(x, y)) => Some((*x, *y)),
+                    Some(Target::Selector(_)) => return Err(read_failed.clone()),
+                };
+                (size, at, None)
+            }
+        };
+        let center = at.unwrap_or((size.0 / 2.0, size.1 / 2.0));
+        let plan = pinch::plan(&pinch::Spec { screen: size, center, scale, rotate, duration }).map_err(Fail::invalid)?;
+        let span = [(plan.span.0 * 10.0).round() / 10.0, (plan.span.1 * 10.0).round() / 10.0];
+        let input_began = Instant::now();
+        self.send_gesture(Gesture::Pinch(plan)).await?;
+        let mut out = fields! {
+            "sent": true,
+            "center": [(center.0 * 10.0).round() / 10.0, (center.1 * 10.0).round() / 10.0],
+            "scale": scale,
+            "rotate": rotate,
+            "span": span,
+        };
+        let Some(before) = before else {
+            out.insert("verified".into(), json!(false));
+            out.insert("screen_changed".into(), json!(false));
+            out.insert("note".into(), json!(UNREAD_NOTE));
+            return Ok(out);
+        };
+        let after = self.observe(input_began, AFTER_DRAG).await.map(|(_, screen)| screen);
+        out.insert("verified".into(), json!(after.is_some()));
+        out.insert("screen_changed".into(), json!(after.is_some_and(|s| s.signature() != before)));
+        Ok(out)
+    }
+
     /// Move the content one step. "down" shows what is further down.
     async fn scroll_step(&mut self, direction: &str) -> Res<(bool, Option<Screen>)> {
         let (w, h) = self.screen_size().await?;
@@ -1067,44 +1231,29 @@ impl Session {
         Ok(fields! { "count": list.len(), "apps": list })
     }
 
-    async fn resolve_bundle(&mut self, app: &str) -> Res<String> {
-        // Something with a dot and no spaces is a bundle id; anything else is
-        // looked up by name.
-        if app.contains('.') && !app.contains(' ') {
-            return Ok(app.to_string());
-        }
-        let want = nfc(app).to_lowercase();
-        let apps = self.list_apps(false).await?;
-        let hits: Vec<&idevice::core_device::AppListEntry> = apps
-            .iter()
-            .filter(|a| nfc(&a.name).to_lowercase() == want)
-            .collect();
-        match hits.len() {
-            1 => Ok(hits[0].bundle_identifier.clone()),
-            0 => Err(Fail::not_sent("app_not_found", format!("no installed app is named \"{app}\""))
-                .hint(t(
-                    "`iph apps`로 이름과 bundle id를 확인하세요.",
-                    "See names and bundle ids with `iph apps`.",
-                ))),
-            _ => Err(Fail::not_sent(
-                "ambiguous_app",
-                format!("{} apps are named \"{app}\"", hits.len()),
-            )
-            .with(
-                "candidates",
-                Value::Array(hits.iter().map(|a| json!(a.bundle_identifier)).collect()),
-            )),
-        }
+    pub(crate) async fn resolve_bundle(&mut self, app: &str) -> Res<String> {
+        let apps = if is_bundle_id(app) { Vec::new() } else { self.list_apps(false).await? };
+        bundle_id_in(&apps, app)
     }
 
     pub async fn cmd_launch(&mut self, args: LaunchArgs) -> Res {
+        args.validate()?;
         let bundle = self.resolve_bundle(&args.app).await?;
         let mut svc = self.app_service().await?;
+        let arguments: Vec<&str> = args.arguments.iter().map(String::as_str).collect();
         let launch_began = Instant::now();
         // From here the launch request may have reached the phone.
         let launched = tokio::time::timeout(
             Duration::from_secs(30),
-            svc.launch_application(bundle.as_str(), &[], args.restart, false, None, None, None),
+            svc.launch_application(
+                bundle.as_str(),
+                &arguments,
+                args.kill_existing(),
+                false,
+                args.environment_dictionary(),
+                None,
+                None,
+            ),
         )
         .await
         .map_err(|_| "no answer within 30 s".to_string())
@@ -1135,13 +1284,20 @@ impl Session {
                 }
             delay = Duration::from_millis(300);
         }
-        Ok(fields! {
+        let mut out = fields! {
             "sent": true,
             "verified": foreground,
             "foreground": foreground,
             "bundle_id": bundle,
             "pid": pid,
-        })
+            "restart": args.kill_existing(),
+        };
+        if args.has_launch_options() {
+            out.insert("restart_implied".into(), json!(!args.restart));
+            out.insert("arguments".into(), json!(args.arguments));
+            out.insert("environment_keys".into(), json!(args.environment.keys().collect::<Vec<_>>()));
+        }
+        Ok(out)
     }
 
     pub async fn cmd_screenshot(&mut self, args: ScreenshotArgs) -> Res {
@@ -1720,5 +1876,103 @@ mod clipboard_tests {
         // `set_text` writes these three kinds.
         assert!(!app_provided(&kinds(&["public.utf8-plain-text", "public.plain-text", "public.text"])));
         assert!(!app_provided(&kinds(&["public.png"])));
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::LaunchArgs;
+    use crate::actions::parse_args;
+    use serde_json::json;
+
+    fn parse(v: serde_json::Value) -> Result<LaunchArgs, crate::reply::Fail> {
+        parse_args::<LaunchArgs>(&v)
+    }
+
+    #[test]
+    fn a_plain_launch_sends_nothing_extra() {
+        let a = parse(json!({"app": "x"})).unwrap();
+        assert!(!a.kill_existing());
+        assert!(a.environment_dictionary().is_none());
+    }
+
+    #[test]
+    fn arguments_or_environment_imply_a_restart() {
+        let a = parse(json!({"app": "x", "arguments": ["-k", "v"]})).unwrap();
+        assert!(a.kill_existing() && !a.restart);
+        let b = parse(json!({"app": "x", "environment": {"TZ": "UTC"}})).unwrap();
+        assert!(b.kill_existing());
+        let dict = b.environment_dictionary().unwrap();
+        assert_eq!(dict.get("TZ").and_then(|v| v.as_string()), Some("UTC"));
+    }
+
+    #[test]
+    fn environment_values_may_hold_an_equals_sign() {
+        let a = parse(json!({"app": "x", "environment": {"K": "a=b"}})).unwrap();
+        assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn environment_names_are_checked() {
+        for name in ["", "A=B"] {
+            let a = parse(json!({"app": "x", "environment": {name: "v"}})).unwrap();
+            assert_eq!(a.validate().unwrap_err().code, "invalid_argument");
+        }
+    }
+
+    #[test]
+    fn a_non_string_value_is_rejected_at_the_boundary() {
+        assert_eq!(parse(json!({"app": "x", "environment": {"A": 1}})).unwrap_err().code, "invalid_argument");
+        assert_eq!(parse(json!({"app": "x", "environment": ["A=1"]})).unwrap_err().code, "invalid_argument");
+        assert_eq!(parse(json!({"app": "x", "arguments": "-a"})).unwrap_err().code, "invalid_argument");
+        assert_eq!(parse(json!({"app": "x", "arguments": [1]})).unwrap_err().code, "invalid_argument");
+    }
+}
+
+#[cfg(test)]
+mod pinch_tests {
+    use super::*;
+    use crate::{config::Config, reply::Outcome};
+
+    fn args(v: Value) -> PinchArgs {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn a_direction_means_a_scale() {
+        assert_eq!(args(json!({"direction": "in"})).motion().unwrap(), (0.5, 0.0));
+        assert_eq!(args(json!({"direction": "out"})).motion().unwrap(), (2.0, 0.0));
+        assert_eq!(args(json!({"direction": "out", "rotate": -30})).motion().unwrap(), (2.0, -30.0));
+        assert_eq!(args(json!({"scale": 1.5, "rotate": 90})).motion().unwrap(), (1.5, 90.0));
+        assert_eq!(args(json!({"rotate": 45})).motion().unwrap(), (1.0, 45.0));
+    }
+
+    #[test]
+    fn arguments_that_cannot_make_a_gesture_are_invalid() {
+        for bad in [
+            json!({}),
+            json!({"scale": 1}),
+            json!({"direction": "out", "scale": 2}),
+            json!({"direction": "sideways"}),
+            json!({"scale": 0.2}),
+            json!({"scale": 5}),
+            json!({"rotate": 181}),
+            json!({"direction": "in", "rotate": -181}),
+        ] {
+            let fail = args(bad.clone()).motion().unwrap_err();
+            assert_eq!((fail.code.as_str(), fail.outcome), ("invalid_argument", Outcome::NotSent), "{bad}");
+        }
+        assert!(serde_json::from_value::<PinchArgs>(json!({"scale": 2, "zoom": 1})).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bad_request_fails_before_the_phone_is_asked_for_anything() {
+        let mut s = Session::new("00000000-TESTONLY-NOPHONE".into(), Config::default());
+        for bad in [json!({}), json!({"direction": "in", "scale": 2}), json!({"scale": 9})] {
+            let fail = s.cmd_pinch(args(bad.clone())).await.unwrap_err();
+            assert_eq!((fail.code.as_str(), fail.outcome), ("invalid_argument", Outcome::NotSent), "{bad}");
+        }
+        let fail = s.cmd_pinch(args(json!({"direction": "in", "at": 7}))).await.unwrap_err();
+        assert_eq!(fail.outcome, Outcome::NotSent);
     }
 }
