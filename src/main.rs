@@ -4,7 +4,7 @@ use std::{io::Read, time::Instant};
 
 use clap::{Parser, Subcommand};
 use iphone_cli::{
-    client, clock, daemon, devices, fields, human,
+    client, clock, daemon, devices, diagnose, events, fields, human,
     mcp,
     reply::{Fail, envelope},
     script, setup,
@@ -38,13 +38,22 @@ struct Cli {
 enum Cmd {
     /// List connected iPhones.
     Devices,
+    /// Save connection diagnostics and optional reproduction output for a GitHub issue.
+    Diagnose(diagnose::Args),
     /// Walk through the one-time preparation of a phone.
-    Setup,
+    Setup {
+        /// Enable disabled Wi-Fi connection/debugging flags over USB.
+        #[arg(long)]
+        fix_wifi: bool,
+    },
     /// Check that the phone is ready; says what to do for each problem.
     Doctor {
         /// Skip the check that sends a real touch (it scrolls Settings down and back).
         #[arg(long)]
         no_touch_test: bool,
+        /// Enable disabled Wi-Fi connection/debugging flags over USB.
+        #[arg(long)]
+        fix_wifi: bool,
     },
     /// List the elements on screen.
     Read {
@@ -106,7 +115,7 @@ enum Cmd {
         /// Replace what the field holds.
         #[arg(long)]
         clear: bool,
-        /// Press Return afterwards.
+        /// Press Return if the input's effect was observed; otherwise withhold it.
         #[arg(long)]
         submit: bool,
     },
@@ -219,6 +228,7 @@ fn swipe_args(direction: &str, duration: Option<u64>, drag: bool) -> Result<Valu
 
 fn main() {
     let cli = Cli::parse();
+    events::init_tracing();
     // The command futures nest deeply; give the thread that polls them room.
     let worker = std::thread::Builder::new()
         .name("iph-main".into())
@@ -244,6 +254,21 @@ async fn run(cli: Cli) -> i32 {
 
     // Commands that need no phone.
     match &cli.command {
+        Cmd::Diagnose(args) => {
+            // Run one finite iph command without a shell. Reject recursive
+            // collectors and interactive/long-lived commands.
+            if !args.command.is_empty() {
+                let child = Cli::try_parse_from(std::iter::once("iph".to_string()).chain(args.command.iter().cloned()));
+                if child.is_ok_and(|c| matches!(c.command, Cmd::Diagnose(_) | Cmd::Daemon | Cmd::Mcp { .. } | Cmd::Setup { .. })) {
+                    let v = envelope(Err(Fail::invalid("diagnose can capture a finite iph command; diagnose, daemon, mcp and setup cannot be nested")), started);
+                    print(&v, human_out, "diagnose");
+                    return 1;
+                }
+            }
+            let v = envelope(diagnose::run(args.clone(), cli.udid.clone()).await, started);
+            print(&v, human_out, "diagnose");
+            return exit_code(&v);
+        }
         Cmd::Scripts => {
             let v = envelope(script::cmd_scripts(), started);
             print(&v, human_out, "scripts");
@@ -285,7 +310,7 @@ async fn run(cli: Cli) -> i32 {
                 }
             };
         }
-        Cmd::Setup => return setup::run(&udid).await,
+        Cmd::Setup { fix_wifi } => return setup::run(&udid, fix_wifi).await,
         Cmd::Stop => {
             let last = client::stop_daemon(&udid).await;
             let v = envelope(Ok(fields! { "stopped": last.is_some() }), started);
@@ -297,7 +322,7 @@ async fn run(cli: Cli) -> i32 {
             print(&v, human_out, "debug");
             return exit_code(&v);
         }
-        Cmd::Doctor { no_touch_test } => ("doctor", json!({ "no_touch_test": no_touch_test })),
+        Cmd::Doctor { no_touch_test, fix_wifi } => ("doctor", json!({ "no_touch_test": no_touch_test, "fix_wifi": fix_wifi })),
         Cmd::Read { app, all, full, raw, max_age } => (
             "read",
             json!({ "app": app, "all": all, "full": full, "raw": raw, "max_age_ms": max_age }),
@@ -394,7 +419,7 @@ async fn run(cli: Cli) -> i32 {
                 }
             }
         }
-        Cmd::Scripts | Cmd::Devices => unreachable!(),
+        Cmd::Scripts | Cmd::Devices | Cmd::Diagnose(_) => unreachable!(),
     };
 
     // iOS 17 미만은 CoreDevice/RSD가 없어 이 경로로는 닿지 않는다.

@@ -1,10 +1,19 @@
 # iphone-cli (`iph`)
 
-A CLI and MCP server that lets AI agents read and operate any app on a **real iPhone** through its accessibility tree. No XCUITest, no WebDriverAgent, no Xcode signing: it talks directly to the Apple developer services Xcode itself uses. Sequences you run often become **scripts** (JavaScript) that execute in one call, without a round trip to the model between steps.
+**Let AI agents read and operate any app on a real iPhone — straight from your terminal.**
 
-Built on the principle of [Poki](https://github.com/JosssphZhou/poki). No Poki code is used; this is a new implementation from the behaviour Poki's documentation describes and from experiments on a device. Device communication relies on [idevice](https://github.com/jkcoxson/idevice) (MIT).
+**No Xcode. No WebDriverAgent. No app installed on the phone. 100% Rust.**
+
+- **Direct Apple developer services** — connects over USB or Wi-Fi to the same accessibility and HID services Xcode uses, with no signing or test runner
+- **Accessibility tree, not screenshots** — reads structured UI elements cleanly, and runs multi-step flows in one call with a built-in QuickJS engine (`iph script`)
+- **Agent-ready** — CLI + MCP server (`iph mcp`) + safety-first outcomes (`done` / `not_sent` / `unknown`)
+- **Single native binary (macOS & Windows)** — no Python, Node.js, or Appium runtime; install one binary and target a real iPhone on **iOS 27+**
 
 한국어: [README.ko.md](README.ko.md)
+
+![iphone-cli demo](docs/demo.gif)
+
+Built on the principle of [Poki](https://github.com/JosssphZhou/poki) (a new implementation from its documented behaviour and device experiments, with no Poki code). Device communication relies on [idevice](https://github.com/jkcoxson/idevice) (MIT).
 
 ```console
 $ iph read --human
@@ -74,11 +83,21 @@ cargo install --path .        # ~/.cargo/bin/iph
 | `settings_in_front` | yes | Settings comes to the front (fails when something covers it). When the screen cannot be read, `accessibility_tree` fails instead |
 | `accessibility_tree` | yes | Screen elements can really be read |
 | `touch_input` | yes | Scrolls the Settings list down one step and back to see that touch lands (`--no-touch-test` skips it) |
-| `wifi` | recommended | For working without the cable |
+| `wifi` | recommended | Wireless lockdown flags and the phone's usbmuxd `Network` entry (see below) |
 | `auto_lock` | recommended | Auto-Lock → Never for long sessions |
 | `do_not_disturb` | info | Shown only while Do Not Disturb from `iph dnd on` is still on |
 
-Which checks proved truly required, and what could not be verified, is in [docs/onboarding.md](docs/onboarding.md) (Korean).
+Setup requirements and how to interpret the checks are in [docs/onboarding.md](docs/onboarding.md) (Korean).
+
+### Wi-Fi setup and troubleshooting
+
+The same Wi-Fi alone is not enough. On supported devices, `EnableWifiConnections` **and** `EnableWifiDebugging` in lockdown's `com.apple.mobile.wireless_lockdown` domain need to be `true` for wireless discovery. With either disabled, the phone may not advertise Bonjour's `_apple-mobdev2._tcp.local.` service, so usbmuxd has no `Network` entry even on the same subnet.
+
+- Connect by USB, unlock and trust the computer, then run `iph setup` or `iph doctor` to read `SupportsWifi`, `SupportsWifiSyncing` and both enable flags. Both commands leave wireless flags unchanged by default.
+- To explicitly enable wireless setup, run `iph setup --fix-wifi` or `iph doctor --fix-wifi` (`iph_doctor` MCP: `fix_wifi: true`). If either support flag is `true`, only enable flags explicitly reported as `false` are set to `true` and read back. Unsupported or unknown values are not changed. Add `--human` to doctor for terminal output; setup keeps its interactive, human-readable output.
+- After enabling the flags, setup briefly checks (up to 4 seconds) for the **same phone's** usbmuxd `Network` entry. `checks[].auto_fixed` records confirmed flag changes; `wifi` remains a warning until the network entry appears. Wi-Fi is optional, so that warning does not prevent USB readiness.
+- If flags are off, doctor names them. Manual alternatives are Finder → select iPhone → “Show this iPhone when on Wi-Fi” (Apple Devices on Windows), and Xcode → Devices and Simulators → “Connect via network”. If an automatic write is rejected or cannot be verified, `detail` contains the key and error; check trust/unlock and retry, or use those controls.
+- If both flags are on but `Network` is absent, check the same Wi-Fi subnet, AP/client isolation and blocked mDNS/Bonjour (`_apple-mobdev2._tcp.local.`). Run doctor again after a short wait. Unreadable flags and failed usbmuxd queries are reported separately rather than assumed to mean disabled flags or a subnet problem.
 
 **Notification banners take taps near the top of the screen.** Banners cover the top of the screen and are not part of the accessibility tree. A tap near the top then lands on the banner and opens another app (this happened once during development). For long unattended work turn Do Not Disturb on with `iph dnd on`, and put it back with `iph dnd off` afterwards. Details: [Do Not Disturb](#do-not-disturb) below.
 
@@ -137,6 +156,20 @@ Scripts, MCP and batch also take an object: `{label, label_contains, label_regex
 The exit code is 0 only with `ok: true`. `batch`, `script` and `run` follow the same table (1 when nothing went out). The one `ok: false` with `outcome: "done"` is `scroll --until` that did not find its target: the scrolls did go out, so it is not `not_sent`; the result has `error.code: "not_found"`, `found: false`, exit code 1. Trying again is safe, but the screen has moved by those scrolls.
 
 The phone does not acknowledge touch reports. So results separate `sent` from `verified` (the screen was read again afterwards), and taps, typing and scrolls report `screen_changed`. When another app came to the front, `app_changed: true` is added.
+
+For `type`, `ok: true` / `outcome: "done"` means the command completed, and `sent: true` means the input keys were sent. **`verified: true` keeps its meaning of reading the field's value afterwards; it does not prove the intended text was entered.** Apps can format, mask, correct or clear pasted text, so no exact match with the requested text is required.
+
+| `type` result | Observation |
+|---|---|
+| `value_before`, `value` | The original field's value before input and after input, **before Return**. `""` is a readable empty string; `null` means unavailable. Whitespace in values is preserved. A different focused field is never substituted. |
+| `value_changed` | `true` / `false` when both values were read; `null` when they could not be compared. |
+| `screen_changed` | Actual comparison of the accessibility trees before input and after restoring the on-screen keyboard (and after Return, if sent). `null` when the final screen could not be read. A field change and a screen change are separate observations, and this does not compare screenshot pixels. |
+| `warning` | `{code, message, hint}` when the effect needs inspection: `value_unchanged`, `value_unreadable`, `value_change_unknown`, `value_empty` (nonempty input but empty result), or `clear_not_observed`. Without `--submit`, these warnings preserve `ok: true` / `outcome: "done"`. |
+| `submit_sent` | `true` when Return was sent, `false` when not requested or withheld; `null` if sending Return failed and it may have gone out. |
+
+An unchanged value may mean paste was blocked, but can also come from masking, app behavior or replacing text with identical text using `--clear`. Check with `iph read` or a screenshot; **do not automatically retype**. If paste appears blocked, check Settings → Apps → the target app → **Paste from Other Apps → Allow**. The observation does not establish that permission was denied.
+
+**`--submit` withholds Return whenever there is a warning**, returning `ok: false`, `outcome: "unknown"`, `error.code: "type_not_verified"`, `submit_sent: false` (exit code 2). The paste/clear keys have already gone out. This also stops scripts and batches, including scripts that catch the error. Inspect before deciding to submit separately with `iph key return`; re-running `type` could duplicate input. This intentionally also holds an identical replacement with `--clear --submit`. Clear-only (`iph type "" --clear`) may submit when the field is observed empty, even if it was empty already. CLI, MCP and script calls share these fields; `batch` keeps them in each type step, and `--human` shows observations and warnings.
 
 ## Configuration
 
@@ -281,8 +314,7 @@ A reading takes more than a second because of the phone: after a request it wait
 - Verified on one device. Other iOS versions may number the accessibility attributes differently (check with `iph read --raw`).
 - Apps whose screen keeps moving (animations, video) take longer to read.
 - Notification banners and system pop-ups are not in the app's tree. `iph dnd on` keeps most banners away, but not what comes through Do Not Disturb.
-- Once, a new input session took no touch at all (cause unknown, one session in about a dozen). `iph dnd` notices this when its pull on Control Center does nothing, and tries again on a new session.
-- **There are stretches when the phone answers slowly.** On the morning of 2026-11-11 this happened four times in two hours (from a few minutes to 40): readings took 2 to 30 s or timed out, and input connections dropped. Once the Mac's CPU was fully used by other work; the cause of the others is unknown (often right after the resident process had been stopped and started several times in a row). In such a stretch a late reading of an earlier screen can be acted on: switching Do Not Disturb failed, Control Center was left open, or the app was left for the home screen. `iph stop`, a minute's wait and a new start brought it back. The record is in [docs/how-it-works.md](docs/how-it-works.md), section 7 (Korean).
+- The screen-reading service can stop answering. iph attempts a restart at most every two minutes, except when the last screen was a system panel or a previous restart did not help. If Control Center cannot be read while recording, close it with `iph button home` or bring an app up with `iph launch`, then read again. See [recovery behavior](docs/how-it-works.md#6-연결과-화면-읽기-복구) (Korean).
 - Portrait only.
 - `iph apps` shows the names the phone reports (usually English). Launch by bundle id to be sure.
 - `iph type` puts back the clipboard's text (or one image). **Content copied in an app (text from Notes, which comes with formatting) is not put back.** Reading it from the computer stalls the phone's clipboard for about a minute, so it is left unread and the clipboard is emptied after typing. The result says `clipboard_restored: false` with a `clipboard_note`.
@@ -302,6 +334,24 @@ iph mcp  ──┼─ unix socket ─ iph daemon ─ lockdown → CoreDeviceProx
                                           ├ appservice                      (launch, app list)
                                           └ screencaptureservice            (capture)
 ```
+
+## Reporting a problem
+
+Create an issue attachment with one command, even when no phone is detected:
+
+```sh
+iph diagnose
+iph diagnose -- read --full        # run the failing iph command once and capture its output
+iph diagnose --wifi -- read        # start with USB connected; unplug when prompted
+```
+
+Attach the generated `iph-diagnostics-*.txt` to a [GitHub issue](https://github.com/HyunSeob/iphone-cli/issues/new/choose), along with the reproduction steps and expected/actual behavior. The file contains readable JSON: versions and network state, raw and parsed usbmuxd lists, phone facts and wireless settings, pairing/connection/tunnel errors with timings, Bonjour advertisements and endpoint TCP probes, recent connection events and daemon logs, and related macOS system logs. UDIDs, addresses, command arguments and captured output are retained for debugging. Pairing records and private keys are not collected.
+
+`--wifi` records USB facts first, then observes discovery for 30 seconds while you unplug the cable. `--duration 60` changes that observation window. The phone selected during the USB baseline remains selected after it disappears; use `--udid` when several phones are attached. Bonjour services may belong to other devices, so the report preserves the advertisements without assuming their identity. On Windows, the Bonjour checks use `dns-sd` if it is installed; missing tools and failed checks are recorded and do not prevent the attachment.
+
+Use `-o report.txt` to choose the output path (existing files are preserved). `--command-timeout 180` changes the reproduction timeout. Collection itself does not change phone settings, install a developer image, or operate the screen. A command supplied after `--` performs its normal actions; the collector runs it once and never repeats it. For ordinary command capture, active device probes run afterwards so they do not initialize a session before the failure. `setup`, `mcp`, `daemon` and nested `diagnose` are not accepted as reproduction commands. Ctrl+C saves the collected partial report. Exit code 0 means the report was saved; the reproduced command's exit code and output are inside it.
+
+Connection events are recorded automatically under `~/Library/Application Support/iph/events/` on macOS or `%LOCALAPPDATA%\iph\events\` on Windows, including failures before a phone is selected. Files rotate at 512 KiB, with 32 recent files retained; the report includes tails of the 8 most recently updated files and the selected phone's daemon log. Each captured output is limited to its last 256 KiB, with truncation marked. `USBMUXD_SOCKET_ADDRESS` can select a nondefault usbmuxd socket for both normal commands and diagnosis.
 
 ## Development
 

@@ -21,6 +21,7 @@ readField({selector, take, regex}) → text, readList({row, columns, group, stop
 tap(target) waits up to 5 s for a selector to appear and hold still; tap([a, b, c]) presses a keypad without re-reading. \
 A call that fails throws an Error with .code, .outcome, .hint and .result (the full result object); uncaught, it ends the script and the result says which call and line. \
 After a call whose outcome is \"unknown\" the script is stopped and cannot go on. \
+For type(), verified means read back, not text matched; inspect value_changed and warning, never automatically retype. submit withholds Return with unknown / type_not_verified when the effect is uncertain. \
 No files, network or timers; Date, JSON, RegExp, Map and the rest of the language are there. The result has outputs (the returned object, plus output() calls), logs, calls and inputs_sent.";
 
 const SELECTOR_DOC: &str = "Selector: a plain string is an exact label (the name part of a \"name, value\" row also counts). \
@@ -100,11 +101,13 @@ fn tools() -> Vec<Value> {
         tool(
             "iph_type",
             "Type text into the field that has the keyboard (tap the field first). Pasted through the clipboard, so Korean and emoji work; \
-             the user's clipboard is put back (not content copied in an app: see clipboard_note). What the field shows comes back as value; it is not judged, since apps format what is pasted.",
+             the user's clipboard is put back (not content copied in an app: see clipboard_note). verified means the value was read, not that it matches the intended text. \
+             Inspect value_before, value, value_changed (true/false/null) and warning. An unchanged value can mean blocked paste, masking or identical replacement; never automatically retype. \
+             screen_changed compares accessibility readings after keyboard restoration (null if unavailable). submit withholds Return with outcome unknown / type_not_verified when the input effect is uncertain.",
             json!({
                 "text": { "type": "string" },
                 "clear": { "type": "boolean", "description": "Replace what the field holds." },
-                "submit": { "type": "boolean", "description": "Press Return afterwards." },
+                "submit": { "type": "boolean", "description": "Press Return only after observing a changed, nonempty value (or an empty value for clear-only). Otherwise withhold Return and return unknown; inspect before taking another action." },
             }),
             &["text"],
         ),
@@ -174,7 +177,10 @@ fn tools() -> Vec<Value> {
         tool(
             "iph_doctor",
             "Check that the phone is ready. Each check says what the user must do when it fails.",
-            json!({ "no_touch_test": { "type": "boolean", "description": "Skip the check that scrolls Settings down and back." } }),
+            json!({
+                "no_touch_test": { "type": "boolean", "description": "Skip the check that scrolls Settings down and back." },
+                "fix_wifi": { "type": "boolean", "description": "Enable disabled Wi-Fi connection/debugging flags over USB and briefly check Network discovery." },
+            }),
             &[],
         ),
     ]
@@ -266,7 +272,7 @@ async fn handle(udid: &str, only: &[String], msg: &Value) -> Option<Value> {
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "iph", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": "Operate a real iPhone through its accessibility tree. Read the screen with iph_read, act with iph_tap / iph_type / iph_scroll, \
-                                     and check `screen_changed` in each result. For a known sequence prefer one iph_script (or a saved one with iph_run): one call instead of one per step. \
+                                     and check `screen_changed` in each result. For typing also check value_changed and warning: verified only means read back. Never automatically retype on a warning. For a known sequence prefer one iph_script (or a saved one with iph_run): one call instead of one per step. \
                                      Outcome \"unknown\" means input may have gone out: read the screen, never resend.",
                 }),
             )

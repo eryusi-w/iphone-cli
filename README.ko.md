@@ -1,10 +1,19 @@
 # iphone-cli (`iph`)
 
-AI 에이전트가 **실제 아이폰**의 아무 앱이나 화면 요소(접근성 트리)로 읽고 누르게 해 주는 CLI + MCP 서버입니다. XCUITest · WebDriverAgent · Xcode 서명 없이, Xcode가 쓰는 애플 개발자 서비스에 직접 붙습니다. 자주 하는 순서는 **스크립트**(자바스크립트)로 적어 AI 왕복 없이 한 번에 실행합니다.
+**AI 에이전트가 실제 아이폰의 아무 앱이나 터미널에서 읽고 조작할 수 있는 CLI & MCP 서버.**
 
-[Poki](https://github.com/JosssphZhou/poki)의 원리를 따라 만들었습니다. 코드는 가져오지 않았고, Poki 문서에 적힌 동작 원리와 직접 실험한 결과로 새로 썼습니다. 기기 통신은 [idevice](https://github.com/jkcoxson/idevice)(MIT)에 기대고 있습니다.
+**No Xcode. No WebDriverAgent. No app installed on the phone. 100% Rust.**
+
+- **Xcode · 서명 · 폰 앱 설치 없음** — USB 또는 Wi-Fi로 애플 개발자 서비스(접근성 · HID)에 직접 붙습니다
+- **스크린샷 추론 대신 접근성 트리** — 화면 구조를 바로 읽고, 자주 쓰는 흐름은 내장 QuickJS 엔진(`iph script`)으로 AI 왕복 없이 한 번에 실행합니다
+- **에이전트 친화 설계** — CLI + MCP 서버(`iph mcp`)와 재시도 판단이 가능한 결과 상태(`done` / `not_sent` / `unknown`)를 제공합니다
+- **단일 네이티브 바이너리 (macOS · Windows)** — Python · Node.js · Appium 런타임 없이 바로 설치하고, **실제 아이폰(iOS 27 이상)** 에서 동작합니다
 
 English: [README.md](README.md)
+
+![iphone-cli 데모](docs/demo.gif)
+
+[Poki](https://github.com/JosssphZhou/poki)의 원리를 따라 만들었습니다(코드는 가져오지 않고 문서와 기기 실험을 바탕으로 새로 구현). 기기 통신은 [idevice](https://github.com/jkcoxson/idevice)(MIT)를 사용합니다.
 
 ```console
 $ iph read --human
@@ -77,11 +86,21 @@ cargo install --path .        # ~/.cargo/bin/iph
 | `settings_in_front` | 필수 | 설정 앱이 앞에 나와야 합니다 (다른 창이 가리면 실패). 화면을 읽을 수 없을 때는 이 대신 `accessibility_tree`가 실패합니다 |
 | `accessibility_tree` | 필수 | 화면 요소가 실제로 읽히는지 |
 | `touch_input` | 필수 | 설정 앱 목록을 한 칸 내렸다 올려서 터치가 실제로 먹는지 확인합니다 (`--no-touch-test`로 건너뜀) |
-| `wifi` | 권장 | 케이블 없이 쓰려면 |
+| `wifi` | 권장 | 기기의 무선 lockdown 플래그와 usbmuxd `Network` 연결 확인 (아래 참고) |
 | `auto_lock` | 권장 | 오래 쓸 때는 자동 잠금 '안 함' |
 | `do_not_disturb` | 알림 | `iph dnd on`으로 켠 방해금지 모드가 아직 켜져 있을 때만 나옵니다 |
 
-어느 항목이 실제로 필수였는지, 무엇을 확인하지 못했는지는 [docs/onboarding.md](docs/onboarding.md)에 적었습니다.
+준비 항목과 점검 결과를 읽는 방법은 [docs/onboarding.md](docs/onboarding.md)에 있습니다.
+
+### Wi-Fi 준비와 문제 해결
+
+같은 Wi-Fi에 있는 것만으로는 충분하지 않습니다. 지원되는 기기는 lockdown의 `com.apple.mobile.wireless_lockdown` 도메인에서 `EnableWifiConnections`와 `EnableWifiDebugging`이 **모두 `true`**여야 무선으로 발견될 수 있습니다. 하나라도 꺼져 있으면 Bonjour의 `_apple-mobdev2._tcp.local.` 서비스를 광고하지 않아, 같은 대역에서도 usbmuxd에 `Network` 연결이 나타나지 않을 수 있습니다.
+
+- USB로 연결하고 잠금 해제·컴퓨터 신뢰를 확인한 뒤 `iph setup` 또는 `iph doctor`를 실행하면 `SupportsWifi`, `SupportsWifiSyncing`과 두 활성화 플래그를 읽습니다. 두 명령 모두 기본 실행에서는 무선 플래그를 변경하지 않습니다.
+- 무선 활성화를 명시적으로 요청하려면 `iph setup --fix-wifi` 또는 `iph doctor --fix-wifi`를 실행하세요 (MCP `iph_doctor`: `fix_wifi: true`). 지원 플래그 중 하나가 `true`이면, 명시적으로 `false`인 활성화 플래그만 `true`로 설정하고 다시 읽어 확인합니다. 미지원이거나 값을 확인할 수 없으면 변경하지 않습니다. doctor는 사람이 볼 때 `--human`을 붙이세요. setup은 기존의 대화형 안내 출력을 유지합니다.
+- 플래그를 켠 뒤 **같은 폰의** usbmuxd `Network` 연결이 나타나는지 최대 4초 확인합니다. 확인된 플래그 변경은 `checks[].auto_fixed`에 표시하고, 연결이 나타나지 않으면 `wifi`는 경고로 남습니다. Wi-Fi는 권장 항목이므로 USB 준비 완료를 막지 않습니다.
+- 플래그가 꺼져 있으면 doctor가 해당 이름을 알려 줍니다. 직접 설정하려면 Finder → iPhone 선택 → 'Wi-Fi에 있을 때 이 iPhone 보기'(윈도: Apple 기기 앱), Xcode → Devices and Simulators → 'Connect via network'를 확인하세요. 자동 쓰기가 거부되거나 재확인에 실패하면 `detail`에 키와 원인이 나옵니다. 신뢰·잠금 상태를 확인해 다시 시도하거나 위 설정을 사용하세요.
+- 두 플래그가 켜져 있는데 `Network`가 없다면 같은 Wi-Fi 대역인지, AP/클라이언트 격리가 꺼져 있는지, mDNS/Bonjour(`_apple-mobdev2._tcp.local.`)가 차단되는지 확인하세요. 설정 직후에는 잠시 뒤 doctor를 다시 실행하세요. 플래그 읽기 실패나 usbmuxd 조회 실패는 꺼진 플래그·네트워크 문제로 단정하지 않고 따로 표시합니다.
 
 **알림 배너는 화면 위쪽 탭을 가로챕니다.** 배너는 화면 위쪽을 덮고 접근성 트리에는 나오지 않습니다. 그때 화면 위쪽을 누르면 배너가 눌려 다른 앱이 열립니다 (만드는 동안 실제로 한 번 겪었습니다). 오래 맡길 때는 `iph dnd on`으로 방해금지 모드를 켜 두고, 끝나면 `iph dnd off`로 되돌리세요. 자세한 내용은 아래 [방해금지 모드](#방해금지-모드).
 
@@ -140,6 +159,20 @@ cargo install --path .        # ~/.cargo/bin/iph
 종료 코드는 `ok: true`일 때만 0입니다. `batch` · `script` · `run`도 같습니다 (아무것도 안 갔으면 1). `ok: false`인데 `outcome: "done"`인 것은 `scroll --until`이 못 찾았을 때 하나입니다: 스크롤은 실제로 다 나갔으므로 `not_sent`(아무것도 안 감)가 아니고, 결과는 `error.code: "not_found"` · `found: false` · 종료 코드 1입니다. 다시 해도 위험하지 않지만 화면은 그만큼 움직여 있습니다.
 
 터치 신호는 폰이 받았다고 답하지 않습니다. 그래서 `sent`(보냄)와 `verified`(보낸 뒤 화면을 다시 읽음)를 나누고, 탭 · 입력 · 스크롤 뒤에는 화면을 다시 읽어 `screen_changed`를 넣습니다. 다른 앱이 앞으로 나왔으면 `app_changed: true`가 붙습니다.
+
+`type`의 `ok: true` · `outcome: "done"`은 명령을 끝까지 실행했다는 뜻이고, `sent: true`는 입력 키를 보냈다는 뜻입니다. **`verified: true`는 기존처럼 입력 후 칸의 값을 다시 읽었다는 뜻이며, 원하는 글이 입력되었다는 보장은 아닙니다.** 앱이 붙여넣은 글을 서식 · 가림 · 자동 고침 · 자동 지우기로 바꿀 수 있어 요청 문자열과의 완전 일치를 요구하지 않습니다.
+
+| `type` 결과 | 관측 내용 |
+|---|---|
+| `value_before`, `value` | 원래 입력칸의 입력 전 값과 입력 후 값(**Return 전**). `""`은 읽을 수 있는 빈 문자열, `null`은 읽기 불가입니다. 값의 공백은 보존하고, 다른 칸으로 포커스가 옮겨가도 그 칸의 값을 대신 보고하지 않습니다. |
+| `value_changed` | 두 값을 읽었으면 `true` · `false`, 비교할 수 없으면 `null`입니다. |
+| `screen_changed` | 입력 전과 화면 키보드를 복구한 후(Return을 보냈다면 그 후)의 접근성 트리를 실제로 비교합니다. 마지막 화면을 읽지 못하면 `null`입니다. 칸의 값 변경과 화면 변경은 별도 관측이며, 스크린샷의 픽셀을 비교하는 것은 아닙니다. |
+| `warning` | 확인이 필요하면 `{code, message, hint}`가 붙습니다: `value_unchanged`(값 불변), `value_unreadable`(입력 후 읽기 불가), `value_change_unknown`(입력 전 값이 없어 비교 불가), `value_empty`(글을 보냈는데 빈 값), `clear_not_observed`(지우기 후에도 값이 남음). `--submit`이 없으면 경고가 있어도 기존 `ok: true` · `outcome: "done"`을 유지합니다. |
+| `submit_sent` | Return을 보냈으면 `true`, 요청하지 않았거나 보류했으면 `false`입니다. Return 전송 중 실패하여 나갔을 수 있으면 `null`입니다. |
+
+값이 그대로면 붙여넣기가 막혔을 수 있지만, 가림 · 앱 동작 · `--clear`로 같은 글을 다시 넣은 경우도 가능합니다. `iph read`나 스크린샷으로 확인하고 **자동으로 재입력하지 마세요.** 붙여넣기가 막힌 것으로 보이면 설정 → 앱 → 해당 앱 → **다른 앱에서 붙여넣기 → 허용**을 확인하세요. 값 불변만으로 권한 거부를 확정할 수는 없습니다.
+
+**`--submit`은 경고가 있으면 Return을 보류**하고 `ok: false` · `outcome: "unknown"` · `error.code: "type_not_verified"` · `submit_sent: false`(종료 코드 2)를 돌려줍니다. 붙여넣기/지우기 키는 이미 나갔습니다. 스크립트와 batch도 여기서 멈추며, 스크립트에서 오류를 잡아도 후속 호출은 폰에 가지 않습니다. 화면을 확인한 뒤 별도로 `iph key return`을 보낼지 판단하세요. `type` 재실행은 중복 입력을 일으킬 수 있습니다. `--clear --submit`으로 같은 글을 바꿔 넣어 값이 같아도 보류하는 의도적인 변경입니다. 지우기만 하는 경우(`iph type "" --clear`)는 빈 값을 읽으면 원래 비어 있었어도 제출할 수 있습니다. CLI · MCP · 스크립트가 같은 결과를 쓰고, batch의 type 단계와 `--human` 표시에도 관측값과 경고가 남습니다.
 
 ## 설정
 
@@ -277,15 +310,14 @@ iPhone 15 Pro Max · iOS 27.0.1 · Wi-Fi, 상주 프로세스가 붙어 있는 �
 | 상주 프로세스가 없을 때 첫 `iph read` (터널 + 구독 포함) | 약 2~3초 |
 | 방해금지 모드 켜기 또는 되돌리기 | 연결이 붙어 있을 때 중앙값 12.5초 (11회, 10.9~14.2초). 상주 프로세스를 막 띄웠을 때 19~36초 |
 
-한 번 읽는 데 1초 넘게 걸리는 것은 폰 쪽 사정입니다. 폰은 요청을 받고 약 1.1초 조용히 기다린 뒤에야 화면을 내보냅니다. 화면이 스스로 자주 바뀌는 앱에서는 옛 화면을 읽지 않으려고 두 번 읽어 맞춰 보기 때문에 단계마다 1~2초가 더 듭니다. 자세한 관찰은 [docs/how-it-works.md](docs/how-it-works.md).
+한 번 읽는 데 1초 넘게 걸리는 것은 폰 쪽 사정입니다. 폰은 요청을 받고 약 1.1초 조용히 기다린 뒤에야 화면을 내보냅니다. 화면이 스스로 자주 바뀌는 앱에서는 옛 화면을 읽지 않으려고 두 번 읽어 맞춰 보기 때문에 단계마다 1~2초가 더 듭니다. 자세한 동작은 [docs/how-it-works.md](docs/how-it-works.md).
 
 ## 알려진 한계
 
 - 검증한 기기는 한 대입니다. 다른 iOS 버전에서는 접근성 속성 번호가 다를 수 있습니다 (`iph read --raw`로 확인).
 - 화면이 계속 움직이는 앱(애니메이션, 동영상)은 읽기가 더 오래 걸립니다.
 - 알림 배너 · 시스템 팝업은 앱의 트리에 나오지 않습니다. 배너는 `iph dnd on`으로 줄일 수 있지만, 방해금지 모드에서도 뜨는 것은 막지 못합니다.
-- 새 입력 세션이 터치를 하나도 받지 않은 일이 한 번 있었습니다 (원인 모름, 세션 십여 개 중 하나). `iph dnd`는 제어 센터 내리기가 먹지 않으면 세션을 새로 열어 다시 시도합니다.
-- **폰의 응답이 느려지는 구간이 있습니다.** 2026-11-11 오전 두 시간 동안 네 번(짧게는 몇 분, 길게는 40분) 읽기가 2~30초씩 걸리거나 시간 초과됐고, 입력 연결이 끊기기도 했습니다. 한 번은 다른 작업이 맥의 CPU를 다 쓰고 있을 때였고, 나머지는 원인을 모릅니다 (상주 프로세스를 연달아 껐다 켠 직후가 많았습니다). 이런 구간에서는 늦게 도착한 옛 화면을 보고 움직일 수 있어서, 방해금지 모드 전환이 실패하거나 제어 센터가 열린 채 남거나 앱에서 홈 화면으로 나간 일이 있었습니다. `iph stop` 뒤 1분쯤 기다렸다 다시 하면 돌아왔습니다. 자세한 기록은 [docs/how-it-works.md](docs/how-it-works.md) 7절.
+- 화면 읽기 서비스가 응답하지 않을 수 있습니다. 마지막 화면이 시스템 패널이거나 이전 재시작이 도움이 되지 않은 경우를 제외하고, 최대 2분에 한 번 재시작을 시도합니다. 화면 녹화 중 제어 센터를 읽지 못하면 `iph button home`으로 닫거나 `iph launch`로 앱을 앞으로 가져온 뒤 다시 읽으세요. [복구 동작](docs/how-it-works.md#6-연결과-화면-읽기-복구)을 참고하세요.
 - 세로 화면만 다룹니다.
 - `iph apps`의 이름은 폰이 알려 주는 이름(대개 영어)입니다. 실행은 bundle id가 확실합니다.
 - `iph type`은 클립보드의 글자(또는 그림 한 장)만 되돌립니다. **앱에서 복사한 내용(메모의 글처럼 서식이 함께 있는 것)은 되돌리지 못합니다.** 그 내용은 컴퓨터에서 읽으려 하면 폰의 클립보드가 1분쯤 멈추기 때문에 읽지 않고, 입력이 끝나면 클립보드를 비웁니다. 결과에 `clipboard_restored: false`와 `clipboard_note`가 나옵니다.
@@ -305,6 +337,24 @@ iph mcp  ──┼─ unix socket ─ iph daemon ─ lockdown → CoreDeviceProx
                                           ├ appservice                      (앱 실행 · 목록)
                                           └ screencaptureservice            (캡처)
 ```
+
+## 문제 신고
+
+기기가 전혀 발견되지 않아도 명령 한 번으로 이슈에 첨부할 진단 파일을 만듭니다.
+
+```sh
+iph diagnose
+iph diagnose -- read --full        # 문제가 나는 iph 명령을 한 번 실행하고 출력 수집
+iph diagnose --wifi -- read        # USB를 연결한 채 시작하고, 안내가 나오면 케이블 제거
+```
+
+생성된 `iph-diagnostics-*.txt`를 재현 순서·기대한 결과·실제 결과와 함께 [GitHub 이슈](https://github.com/HyunSeob/iphone-cli/issues/new/choose)에 첨부하세요. 파일은 읽기 쉬운 JSON이며 버전·네트워크 상태, usbmuxd 원본 응답과 해석된 목록, 기기 정보·무선 연결 설정, 페어링·연결·터널의 단계별 오류와 시간, Bonjour 광고와 해당 주소의 TCP 연결 검사, 최근 연결 이벤트·상주 프로세스 로그·관련 macOS 시스템 로그를 담습니다. 분석을 위해 UDID·주소·실행 인자·수집한 출력을 유지하며, 페어링 기록과 개인키는 수집하지 않습니다.
+
+`--wifi`는 USB 연결 상태를 먼저 기록하고 케이블을 뺄 동안 30초간 기기 발견 변화를 관찰합니다. 관찰 시간은 `--duration 60`처럼 바꿀 수 있습니다. USB 상태에서 고른 폰은 목록에서 사라져도 계속 진단 대상으로 유지합니다. 폰이 여러 대면 `--udid`로 고르세요. Bonjour 광고는 다른 기기의 것일 수도 있어서 원본과 함께 기록합니다. 윈도에서는 `dns-sd`가 설치되어 있으면 Bonjour도 검사합니다. 도구가 없거나 검사가 실패해도 그 이유를 기록하고 파일을 만듭니다.
+
+저장 위치는 `-o report.txt`, 재현 명령의 제한 시간은 `--command-timeout 180`으로 지정합니다. 기존 파일은 덮어쓰지 않습니다. 수집 자체는 폰 설정 변경·개발자 이미지 설치·화면 조작을 하지 않습니다. `--` 뒤에 준 명령은 원래 동작을 수행하며, 진단 기능은 그 명령을 한 번 실행하고 재실행하지 않습니다. 일반 명령 수집에서는 진단 세션을 열어 증상이 달라지지 않도록 문제 명령 실행 후에 기기 연결 검사를 합니다. `setup`·`mcp`·`daemon`·중첩된 `diagnose`는 재현 명령으로 받지 않습니다. Ctrl+C로 중단해도 모은 내용은 파일에 저장합니다. 종료 코드 0은 파일 저장 성공을 뜻하며, 재현 명령의 종료 코드와 출력은 파일 안에 있습니다.
+
+연결 이벤트는 기기를 고르기 전의 실패부터 자동으로 기록합니다. 맥은 `~/Library/Application Support/iph/events/`, 윈도는 `%LOCALAPPDATA%\iph\events\`이며, 파일당 512 KiB에서 교체하고 최근 32개를 유지합니다. 진단 파일에는 최근 갱신된 이벤트 파일 8개와 선택한 폰의 상주 로그 끝부분을 넣습니다. 수집하는 각 출력은 마지막 256 KiB까지 남기고 잘렸는지 표시합니다. `USBMUXD_SOCKET_ADDRESS`로 기본값과 다른 usbmuxd 소켓을 쓰면 일반 명령과 진단 모두 같은 주소를 사용합니다.
 
 ## 개발
 
